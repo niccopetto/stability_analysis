@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.patches import Ellipse
+from matplotlib.patches import Ellipse, Circle
 from matplotlib.widgets import RectangleSelector
 import seaborn as sns
 from skimage import io as skio
@@ -45,11 +45,23 @@ OUTPUT_DIR = ROOT_DIR / "output"
 # Percorso dedicato per le immagini Pointing Lanex (Feature 2)
 POINTING_LANEX_DIR = Path(r"U:\unwrapped_pointing_lanex")
 
-# Fattore di conversione pixel → millimetri per Pointing Lanex (Feature 4)
-PX_TO_MM = 0.064  # 1 pixel = 64 micron = 0.064 mm
+# Percorso per le immagini Top Imaging (stesso layout di ROOT_DIR se non separato)
+TOP_IMAGING_DIR = ROOT_DIR
+
+# ── Fattori di Conversione Pixel → Millimetri ──
+PX_TO_MM = 0.064           # Pointing Lanex: 1 pixel = 64 µm = 0.064 mm
+PX_TO_MM_SIDE = 1.0 / 179  # Side Imaging: 179 px = 1 mm ≈ 0.00559 mm/px
+PX_TO_MM_TOP = 1.0          # Top Imaging: NON calibrato — aggiornare quando noto
 
 # Soglia frazionaria per la lunghezza del plasma (20% del massimo)
 PLASMA_THRESHOLD_FRACTION = 0.2
+
+# ── Parametri Rilevamento Nozzle (Side View) ──
+NOZZLE_CONTOUR_LEVEL_FRACTION = 0.15   # Soglia contorno (15% del massimo raw)
+NOZZLE_INTENSITY_UPPER_LIMIT = None    # Limite superiore intensità per clipping
+                                        # riflessi sul nozzle (None = disabilitato;
+                                        # impostare es. 120 se i riflessi creano
+                                        # contorni spuri)
 
 # ── Parametri Classificazione Fascio (Pointing Lanex) ──
 BEAM_PEAK_THRESHOLD_HI = 0.25     # Soglia alta (30%) per separare blob multipli
@@ -64,11 +76,12 @@ INSTRUMENTS = {
     'Andor_Lanex':    'Path_Andor',
     'Pointing_Lanex': 'Path_Pointing',
     'SideImaging':    'Path_SideImaging',
+    'TopImaging':     'Path_TopImaging',
 }
 
 # Pattern regex per il parsing dei nomi file TIFF
 FILENAME_RE = re.compile(
-    r'^(Andor_Lanex|SideImaging|Pointing_Lanex)_(\d{8})_(\d+)\.tiff?$',
+    r'^(Andor_Lanex|SideImaging|Pointing_Lanex|TopImaging)_(\d{8})_(\d+)\.tiff?$',
     re.IGNORECASE
 )
 
@@ -200,6 +213,182 @@ def find_first_mask_free_pointing(df: pd.DataFrame) -> str | None:
 def crop_image(image: np.ndarray, roi: dict) -> np.ndarray:
     """Ritaglia un'immagine usando le coordinate ROI."""
     return image[roi['y_min']:roi['y_max'], roi['x_min']:roi['x_max']]
+
+
+def interactive_circular_roi_selection(
+        image: np.ndarray,
+        title: str = "Select Circular ROI") -> dict | None:
+    """Mostra un'immagine e permette la selezione di un ROI circolare.
+
+    Interazione:
+      1. Click sinistro → definisce il centro.
+      2. Trascina o click successivo → definisce il raggio.
+      3. Premi 'Enter' per confermare.
+
+    Returns
+    -------
+    dict con chiavi 'center_x', 'center_y', 'radius' (in pixel)
+    oppure None se nessuna selezione è stata fatta.
+    """
+    state = {'center': None, 'radius': None, 'circle_patch': None}
+
+    def on_press(event):
+        if event.inaxes is None:
+            return
+        state['center'] = (event.xdata, event.ydata)
+        state['radius'] = None
+        # Rimuovi cerchio precedente se c'è
+        if state['circle_patch'] is not None:
+            state['circle_patch'].remove()
+            state['circle_patch'] = None
+        fig.canvas.draw_idle()
+
+    def on_motion(event):
+        if state['center'] is None or event.inaxes is None:
+            return
+        cx, cy = state['center']
+        r = np.sqrt((event.xdata - cx) ** 2 + (event.ydata - cy) ** 2)
+        state['radius'] = r
+        # Aggiorna il cerchio
+        if state['circle_patch'] is not None:
+            state['circle_patch'].remove()
+        circle = Circle(
+            (cx, cy), r,
+            facecolor='none', edgecolor='lime', linewidth=2, linestyle='--'
+        )
+        state['circle_patch'] = ax.add_patch(circle)
+        fig.canvas.draw_idle()
+
+    def on_release(event):
+        if state['center'] is None or event.inaxes is None:
+            return
+        cx, cy = state['center']
+        r = np.sqrt((event.xdata - cx) ** 2 + (event.ydata - cy) ** 2)
+        if r > 1:
+            state['radius'] = r
+
+    def on_key(event):
+        if event.key == 'enter' and state['center'] is not None \
+                and state['radius'] is not None:
+            plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.imshow(image, cmap='gray')
+    ax.grid(False)
+    ax.set_title(f"{title}\nClick center, drag radius, press 'Enter'.")
+
+    fig.canvas.mpl_connect('button_press_event', on_press)
+    fig.canvas.mpl_connect('motion_notify_event', on_motion)
+    fig.canvas.mpl_connect('button_release_event', on_release)
+    fig.canvas.mpl_connect('key_press_event', on_key)
+    plt.show(block=True)
+
+    if state['center'] is None or state['radius'] is None:
+        log.warning("Nessun ROI circolare selezionato")
+        return None
+
+    cx, cy = state['center']
+    r = state['radius']
+    log.info("ROI circolare: centro=(%.1f, %.1f), raggio=%.1f px",
+             cx, cy, r)
+    return {'center_x': cx, 'center_y': cy, 'radius': r}
+
+
+def apply_circular_mask(image: np.ndarray, roi_circle: dict) -> np.ndarray:
+    """Applica una maschera circolare: pixel fuori dal cerchio → 0.
+
+    Parameters
+    ----------
+    image : np.ndarray (2D)
+    roi_circle : dict con chiavi 'center_x', 'center_y', 'radius'
+
+    Returns
+    -------
+    np.ndarray — copia dell'immagine con pixel esterni azzerati.
+    """
+    cx = roi_circle['center_x']
+    cy = roi_circle['center_y']
+    r = roi_circle['radius']
+    rows, cols = np.indices(image.shape[:2], dtype=np.float64)
+    dist = np.sqrt((cols - cx) ** 2 + (rows - cy) ** 2)
+    masked = image.copy().astype(np.float64)
+    masked[dist > r] = 0.0
+    return masked
+
+
+def find_first_image_for_instrument(
+        df: pd.DataFrame, path_col: str) -> str | None:
+    """Trova il primo shot con un'immagine valida per uno strumento dato."""
+    if path_col not in df.columns:
+        return None
+    candidates = df[df[path_col].notna()]
+    if candidates.empty:
+        return None
+    return candidates.iloc[0][path_col]
+
+
+def save_plasma_debug_image(
+        raw_image: np.ndarray,
+        cleaned_image: np.ndarray,
+        result: dict,
+        output_path: Path,
+        title_prefix: str = ""):
+    """Salva un'immagine di debug per l'analisi del canale di plasma.
+
+    Sovrappone all'immagine:
+    - Contorno del nozzle (se trovato)
+    - Punta del nozzle (croce rossa)
+    - Centroide del plasma (croce gialla)
+    - Profilo Z robusto (subplot)
+    """
+    debug = result.get('debug_data', {})
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    # ── Left: immagine con overlay ──
+    ax = axes[0]
+    ax.imshow(cleaned_image, cmap='inferno', aspect='auto')
+    ax.grid(False)
+
+    nozzle_contour = debug.get('nozzle_contour')
+    if nozzle_contour is not None:
+        ax.plot(nozzle_contour[:, 1], nozzle_contour[:, 0],
+                color='cyan', linewidth=1.5, alpha=0.8, label='Nozzle contour')
+
+    nozzle_tip = debug.get('nozzle_tip')
+    if nozzle_tip is not None:
+        ax.plot(nozzle_tip[0], nozzle_tip[1], 'rx', markersize=12,
+                markeredgewidth=2.5, label='Nozzle tip', zorder=10)
+
+    z_c = result.get('Plasma_Z_Position')
+    y_c = result.get('Plasma_Y_Position')
+    if z_c is not None and y_c is not None:
+        if not np.isnan(z_c) and not np.isnan(y_c):
+            ax.plot(z_c, y_c, 'y+', markersize=14, markeredgewidth=2.5,
+                    label='Plasma centroid', zorder=10)
+
+    ax.legend(loc='upper right', fontsize=8)
+    ax.set_title(f"{title_prefix} Plasma Channel Overlay")
+
+    # ── Right: Z profile ──
+    ax2 = axes[1]
+    z_profile = debug.get('z_profile_robust')
+    if z_profile is not None:
+        ax2.plot(z_profile, label='Robust Z profile (90th pctl)')
+        threshold_val = result.get('Max_Intensity', 0) * PLASMA_THRESHOLD_FRACTION
+        ax2.axhline(threshold_val, color='r', ls='--', alpha=0.7,
+                     label=f'Threshold ({PLASMA_THRESHOLD_FRACTION*100:.0f}%)')
+        if z_c is not None and not np.isnan(z_c):
+            ax2.axvline(z_c, color='gold', ls=':', alpha=0.7,
+                         label=f'Z centroid = {z_c:.1f}')
+        ax2.set_xlabel('Z (pixel)')
+        ax2.set_ylabel('Intensity (90th pctl)')
+        ax2.legend(fontsize=8)
+    ax2.set_title('Robust Z Profile')
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120)
+    plt.close(fig)
+    log.debug("Debug image salvata: %s", output_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -339,6 +528,7 @@ def phase2_map_files(df: pd.DataFrame, root_dir: Path, target_date: str = None) 
     # Cerca ricorsivamente file TIFF:
     # - SideImaging e Andor_Lanex in ROOT_DIR
     # - Pointing_Lanex in POINTING_LANEX_DIR (Feature 2)
+    # - TopImaging in TOP_IMAGING_DIR (se diverso da ROOT_DIR)
     tiff_files = list(root_dir.rglob('*.tif')) + list(root_dir.rglob('*.tiff'))
     log.info("Trovati %d file TIFF in %s", len(tiff_files), root_dir)
     if POINTING_LANEX_DIR.exists():
@@ -348,6 +538,16 @@ def phase2_map_files(df: pd.DataFrame, root_dir: Path, target_date: str = None) 
         tiff_files.extend(pointing_files)
     else:
         log.warning("Percorso Pointing Lanex non trovato: %s", POINTING_LANEX_DIR)
+
+    # Top Imaging: aggiungi file da TOP_IMAGING_DIR se diverso da ROOT_DIR
+    if TOP_IMAGING_DIR.resolve() != root_dir.resolve() and TOP_IMAGING_DIR.exists():
+        top_files = (list(TOP_IMAGING_DIR.rglob('*.tif'))
+                     + list(TOP_IMAGING_DIR.rglob('*.tiff')))
+        log.info("Trovati %d file TIFF TopImaging in %s",
+                 len(top_files), TOP_IMAGING_DIR)
+        tiff_files.extend(top_files)
+    elif not TOP_IMAGING_DIR.exists():
+        log.warning("Percorso Top Imaging non trovato: %s", TOP_IMAGING_DIR)
 
     # Dizionario per raccogliere i background per strumento+data.
     # Preferisce shot 0; se non disponibile, usa shot 1 come fallback.
@@ -406,25 +606,32 @@ def phase2_map_files(df: pd.DataFrame, root_dir: Path, target_date: str = None) 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def phase3_batch_process(df: pd.DataFrame, roi: dict = None, run_mode: str = "STEP_1_CLASSIFY") -> pd.DataFrame:
+def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
+                         roi_circle_top: dict = None,
+                         run_mode: str = "STEP_1_CLASSIFY",
+                         debug_output_dir: Path = None,
+                         debug_max_shots: int = 5) -> pd.DataFrame:
     """Itera sugli shot, applica le funzioni di diagnostics_lib.
 
     Per ogni shot:
-    - Controlla se iniezione è fallita o c'è filamentazione → Beam_Type = 'Null'
-    - SideImaging → analyze_plasma_channel
-    - Pointing_Lanex (se Pointing_State == IN): classify_beam → analyze_pointing_profile (jitter)
-    - Andor_Lanex (se Magnet_State == IN): analyze_energy_spectrum (energia)
-      [TEMPORANEAMENTE SOSPESO — da integrare successivamente]
-
-    Nota: Pointing Lanex e Spettrometro Magnetico (Andor) sono su assi
-    indipendenti; i rispettivi stati (Pointing_IN/OUT, Magnet_IN/OUT)
-    sono gestiti separatamente.
+    - Injection_Success == False ("No") → salta TUTTO, Beam_Type = 'Null'
+    - Is_Filamented → calcola centroide/nozzle (Side+Top) ma salta
+      Plasma_Length; salta Pointing/Andor, Beam_Type = 'Null'
+    - SideImaging → analyze_plasma_channel_side (con nozzle da raw image)
+    - TopImaging → analyze_plasma_channel_top (con ROI circolare)
+    - Pointing_Lanex → classify_beam → analyze_pointing_profile
+    - Andor_Lanex → [TEMPORANEAMENTE SOSPESO]
 
     Parameters
     ----------
     roi : dict or None
-        Coordinate ROI per il crop delle immagini Pointing Lanex (Feature 1).
-        Se None, le immagini non vengono croppate.
+        Coordinate ROI rettangolare per il crop Pointing Lanex.
+    roi_circle_top : dict or None
+        ROI circolare per Top Imaging {'center_x', 'center_y', 'radius'}.
+    debug_output_dir : Path or None
+        Se impostato, salva immagini di debug per i primi shot.
+    debug_max_shots : int
+        Numero massimo di shot per cui salvare immagini di debug.
     """
     log.info("═══ FASE 3: Batch Processing ═══")
 
@@ -435,55 +642,169 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None, run_mode: str = "ST
     for key, path in backgrounds.items():
         bg_cache[key] = safe_imread(path)
 
-    # Colonne risultato
-    result_cols = [
-        'Plasma_Z_Position', 'Plasma_Length', 'Max_Intensity',
-        'Beam_Type', 'N_Blobs', 'Compactness',
+    # ── Colonne risultato (esistenti + nuove) ──
+    result_cols_str = ['Beam_Type']
+    result_cols_num = [
+        # Side View
+        'Plasma_Z_Position', 'Plasma_Z_Position_err',
+        'Plasma_Z_Position_rel',
+        'Plasma_Y_Position', 'Plasma_Y_Position_err',
+        'Plasma_Length', 'Plasma_Length_err',
+        'Max_Intensity',
+        'Nozzle_Tip_Z', 'Nozzle_Tip_Y',
+        'Nozzle_Distance_Y', 'Nozzle_Distance_Y_err',
+        'Nozzle_Distance_Y_mm', 'Nozzle_Distance_Y_mm_err',
+        # Top View
+        'Top_Plasma_Z_Position', 'Top_Plasma_Z_Position_err',
+        'Top_Plasma_Y_Position', 'Top_Plasma_Y_Position_err',
+        'Top_Plasma_Length', 'Top_Plasma_Length_err',
+        'Top_Max_Intensity',
+        # Pointing
+        'N_Blobs', 'Compactness',
         'X_c', 'Y_c', 'Sigma_X', 'Sigma_Y', 'Total_Intensity',
-        'Peak_X', 'Energy_Spread_px'
+        # Energy (sospeso)
+        'Peak_X', 'Energy_Spread_px',
     ]
-    for col in result_cols:
+    for col in result_cols_str:
         if col not in df.columns:
-            if col == 'Beam_Type':
-                df[col] = pd.Series(dtype=object)
-            else:
-                df[col] = np.nan
+            df[col] = pd.Series(dtype=object)
+    for col in result_cols_num:
+        if col not in df.columns:
+            df[col] = np.nan
 
     total_shots = len(df)
     processed = 0
+    debug_saved = 0
+
+    if debug_output_dir is not None:
+        debug_output_dir.mkdir(parents=True, exist_ok=True)
 
     for shot in df.index:
-        # Leggi i valori di riga direttamente dal DataFrame per colonna
-        # (pd.Series non ha il metodo .get(); usare df.at[] è più sicuro e veloce)
         date_val = df.at[shot, 'Giorno']
         date_str = str(date_val) if pd.notna(date_val) else None
 
-        # ── 3A. Side Imaging → Plasma Channel ──────────────────────────────
+        # ── Controllo preventivo: Injection_Success ──
+        is_injected = df.at[shot, 'Injection_Success'] \
+            if 'Injection_Success' in df.columns else True
+        is_filamented = df.at[shot, 'Is_Filamented'] \
+            if 'Is_Filamented' in df.columns else False
+
+        if not is_injected:
+            # "No" → salta TUTTO
+            df.at[shot, 'Beam_Type'] = 'Null'
+            processed += 1
+            if processed % 50 == 0 or processed == total_shots:
+                log.info("Processati %d/%d shot", processed, total_shots)
+            continue
+
+        # ── compute_length: True solo se NON filamented ──
+        compute_length = not is_filamented
+
+        # ── 3A. Side Imaging → Plasma Channel ──────────────────────
         if run_mode == "STEP_2_ANALYZE":
             try:
                 si_path = df.at[shot, 'Path_SideImaging']
                 if pd.notna(si_path):
-                    img_si = safe_imread(si_path)
-                    if img_si is not None:
+                    img_si_raw = safe_imread(si_path)
+                    if img_si_raw is not None:
+                        img_si_clean = img_si_raw.copy().astype(np.float64)
+
                         # Sottrai background se disponibile
                         if date_str:
                             bg = bg_cache.get(('SideImaging', date_str))
-                            if bg is not None and bg.shape == img_si.shape:
-                                img_si = diag.subtract_background(img_si, bg)['cleaned_image']
+                            if bg is not None and bg.shape == img_si_raw.shape:
+                                img_si_clean = diag.subtract_background(
+                                    img_si_raw, bg)['cleaned_image']
                             else:
-                                log.warning("Shot %s | SideImaging: background non disponibile o shape incompatibile", shot)
-                        res = diag.analyze_plasma_channel(img_si, PLASMA_THRESHOLD_FRACTION)
-                        df.at[shot, 'Plasma_Z_Position'] = res['Plasma_Z_Position']
-                        df.at[shot, 'Plasma_Length'] = res['Plasma_Length']
-                        df.at[shot, 'Max_Intensity'] = res['Max_Intensity']
+                                log.warning(
+                                    "Shot %s | SideImaging: background "
+                                    "non disponibile o shape incompatibile",
+                                    shot)
+
+                        res_si = diag.analyze_plasma_channel_side(
+                            img_si_clean,
+                            raw_image=img_si_raw,
+                            threshold_fraction=PLASMA_THRESHOLD_FRACTION,
+                            contour_level_fraction=NOZZLE_CONTOUR_LEVEL_FRACTION,
+                            intensity_upper_limit=NOZZLE_INTENSITY_UPPER_LIMIT,
+                            px_to_mm=PX_TO_MM_SIDE,
+                            compute_length=compute_length,
+                        )
+
+                        # Salva risultati nel DataFrame
+                        df.at[shot, 'Plasma_Z_Position'] = res_si['Plasma_Z_Position']
+                        df.at[shot, 'Plasma_Z_Position_err'] = res_si['Plasma_Z_Position_err']
+                        df.at[shot, 'Plasma_Z_Position_rel'] = res_si['Plasma_Z_Position_rel']
+                        df.at[shot, 'Plasma_Y_Position'] = res_si['Plasma_Y_Position']
+                        df.at[shot, 'Plasma_Y_Position_err'] = res_si['Plasma_Y_Position_err']
+                        df.at[shot, 'Plasma_Length'] = res_si['Plasma_Length']
+                        df.at[shot, 'Plasma_Length_err'] = res_si['Plasma_Length_err']
+                        df.at[shot, 'Max_Intensity'] = res_si['Max_Intensity']
+                        df.at[shot, 'Nozzle_Tip_Z'] = res_si['Nozzle_Tip_Z']
+                        df.at[shot, 'Nozzle_Tip_Y'] = res_si['Nozzle_Tip_Y']
+                        df.at[shot, 'Nozzle_Distance_Y'] = res_si['Nozzle_Distance_Y']
+                        df.at[shot, 'Nozzle_Distance_Y_err'] = res_si['Nozzle_Distance_Y_err']
+                        df.at[shot, 'Nozzle_Distance_Y_mm'] = res_si['Nozzle_Distance_Y_mm']
+                        df.at[shot, 'Nozzle_Distance_Y_mm_err'] = res_si['Nozzle_Distance_Y_mm_err']
+
+                        # Debug image (primi N shot)
+                        if debug_output_dir is not None \
+                                and debug_saved < debug_max_shots:
+                            save_plasma_debug_image(
+                                img_si_raw, img_si_clean, res_si,
+                                debug_output_dir / f'debug_side_shot{shot}.png',
+                                title_prefix=f'Shot {shot} Side')
+                            debug_saved += 1
             except Exception as e:
                 log.warning("Shot %s | SideImaging fallito: %s", shot, e)
 
-        # Controlla se vale la pena analizzare le telecamere a valle
-        is_injected = df.at[shot, 'Injection_Success'] if 'Injection_Success' in df.columns else True
-        is_filamented = df.at[shot, 'Is_Filamented'] if 'Is_Filamented' in df.columns else False
-        
-        if not is_injected or is_filamented:
+        # ── 3A-bis. Top Imaging → Plasma Channel ──────────────────
+        if run_mode == "STEP_2_ANALYZE":
+            try:
+                ti_path_col = 'Path_TopImaging'
+                if ti_path_col in df.columns:
+                    ti_path = df.at[shot, ti_path_col]
+                    if pd.notna(ti_path):
+                        img_ti = safe_imread(ti_path)
+                        if img_ti is not None:
+                            img_ti_clean = img_ti.copy().astype(np.float64)
+
+                            # Sottrai background
+                            if date_str:
+                                bg = bg_cache.get(('TopImaging', date_str))
+                                if bg is not None and bg.shape == img_ti.shape:
+                                    img_ti_clean = diag.subtract_background(
+                                        img_ti, bg)['cleaned_image']
+                                else:
+                                    log.warning(
+                                        "Shot %s | TopImaging: background "
+                                        "non disponibile o shape "
+                                        "incompatibile", shot)
+
+                            # Applica ROI circolare
+                            if roi_circle_top is not None:
+                                img_ti_clean = apply_circular_mask(
+                                    img_ti_clean, roi_circle_top)
+
+                            res_ti = diag.analyze_plasma_channel_top(
+                                img_ti_clean,
+                                threshold_fraction=PLASMA_THRESHOLD_FRACTION,
+                                px_to_mm=PX_TO_MM_TOP,
+                                compute_length=compute_length,
+                            )
+
+                            df.at[shot, 'Top_Plasma_Z_Position'] = res_ti['Plasma_Z_Position']
+                            df.at[shot, 'Top_Plasma_Z_Position_err'] = res_ti['Plasma_Z_Position_err']
+                            df.at[shot, 'Top_Plasma_Y_Position'] = res_ti['Plasma_Y_Position']
+                            df.at[shot, 'Top_Plasma_Y_Position_err'] = res_ti['Plasma_Y_Position_err']
+                            df.at[shot, 'Top_Plasma_Length'] = res_ti['Plasma_Length']
+                            df.at[shot, 'Top_Plasma_Length_err'] = res_ti['Plasma_Length_err']
+                            df.at[shot, 'Top_Max_Intensity'] = res_ti['Max_Intensity']
+            except Exception as e:
+                log.warning("Shot %s | TopImaging fallito: %s", shot, e)
+
+        # ── Filamented → salta analisi a valle ──
+        if is_filamented:
             df.at[shot, 'Beam_Type'] = 'Null'
             processed += 1
             if processed % 50 == 0 or processed == total_shots:
@@ -492,8 +813,9 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None, run_mode: str = "ST
 
         # ── 3B. Pointing Lanex ─────────────────────────
         try:
-            pt_state = df.at[shot, 'Pointing_State'] if 'Pointing_State' in df.columns else None
-            
+            pt_state = df.at[shot, 'Pointing_State'] \
+                if 'Pointing_State' in df.columns else None
+
             if pd.notna(pt_state) and str(pt_state).upper() == 'IN':
                 pt_path = df.at[shot, 'Path_Pointing']
                 if pd.notna(pt_path):
@@ -503,9 +825,13 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None, run_mode: str = "ST
                         if date_str:
                             bg = bg_cache.get(('Pointing_Lanex', date_str))
                             if bg is not None and bg.shape == img_pt.shape:
-                                img_pt = diag.subtract_background(img_pt, bg)['cleaned_image']
+                                img_pt = diag.subtract_background(
+                                    img_pt, bg)['cleaned_image']
                             else:
-                                log.warning("Shot %s | Pointing: background non disponibile o shape incompatibile", shot)
+                                log.warning(
+                                    "Shot %s | Pointing: background "
+                                    "non disponibile o shape incompatibile",
+                                    shot)
 
                         # ─── Crop ROI (Feature 1) ───
                         if roi is not None:
@@ -525,15 +851,17 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None, run_mode: str = "ST
                         if run_mode == "STEP_1_CLASSIFY":
                             df.at[shot, 'Beam_Type'] = classification['label']
                             df.at[shot, 'N_Blobs'] = classification['n_blobs']
-                            df.at[shot, 'Compactness'] = classification.get('compactness', 0.0)
+                            df.at[shot, 'Compactness'] = classification.get(
+                                'compactness', 0.0)
 
                         elif run_mode == "STEP_2_ANALYZE":
                             beam_label = df.at[shot, 'Beam_Type']
                             if pd.isna(beam_label):
                                 beam_label = classification['label']
-                            
+
                             df.at[shot, 'N_Blobs'] = classification['n_blobs']
-                            df.at[shot, 'Compactness'] = classification.get('compactness', 0.0)
+                            df.at[shot, 'Compactness'] = classification.get(
+                                'compactness', 0.0)
 
                             # Analisi completa SOLO per Collimati
                             if beam_label == 'Collimated':
@@ -541,39 +869,21 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None, run_mode: str = "ST
                                     img_pt,
                                     blob_mask=classification['primary_mask']
                                 )
-                                # Feature 4: conversione pixel → mm (1 px = 0.064 mm)
-                                df.at[shot, 'X_c'] = profile['X_c'] * PX_TO_MM
-                                df.at[shot, 'Y_c'] = profile['Y_c'] * PX_TO_MM
-                                df.at[shot, 'Sigma_X'] = profile['Sigma_X'] * PX_TO_MM
-                                df.at[shot, 'Sigma_Y'] = profile['Sigma_Y'] * PX_TO_MM
-                                df.at[shot, 'Total_Intensity'] = profile['Total_Intensity']
-                            # Per Diffused e Multiple: X_c, Y_c, Sigma restano NaN
+                                df.at[shot, 'X_c'] = \
+                                    profile['X_c'] * PX_TO_MM
+                                df.at[shot, 'Y_c'] = \
+                                    profile['Y_c'] * PX_TO_MM
+                                df.at[shot, 'Sigma_X'] = \
+                                    profile['Sigma_X'] * PX_TO_MM
+                                df.at[shot, 'Sigma_Y'] = \
+                                    profile['Sigma_Y'] * PX_TO_MM
+                                df.at[shot, 'Total_Intensity'] = \
+                                    profile['Total_Intensity']
         except Exception as e:
             log.warning("Shot %s | Pointing fallito: %s", shot, e)
 
         # ── 3C. Andor Lanex (Spettrometro) ─────────────────────────
         # [TEMPORANEAMENTE SOSPESO — da integrare successivamente]
-        # try:
-        #     mag_state = df.at[shot, 'Magnet_State'] if 'Magnet_State' in df.columns else None
-        #
-        #     if pd.notna(mag_state) and str(mag_state).upper() == 'IN':
-        #         an_path = df.at[shot, 'Path_Andor']
-        #         if pd.notna(an_path):
-        #             img_an = safe_imread(an_path)
-        #             if img_an is not None:
-        #                 # Sottrai background se disponibile
-        #                 if date_str:
-        #                     bg = bg_cache.get(('Andor_Lanex', date_str))
-        #                     if bg is not None and bg.shape == img_an.shape:
-        #                         img_an = diag.subtract_background(img_an, bg)['cleaned_image']
-        #                     else:
-        #                         log.warning("Shot %s | Andor: background non disponibile o shape incompatibile", shot)
-        #
-        #                 spec = diag.analyze_energy_spectrum(img_an)
-        #                 df.at[shot, 'Peak_X'] = spec['Peak_X']
-        #                 df.at[shot, 'Energy_Spread_px'] = spec['Energy_Spread_px']
-        # except Exception as e:
-        #     log.warning("Shot %s | Andor fallito: %s", shot, e)
 
         processed += 1
         if processed % 50 == 0 or processed == total_shots:
@@ -972,25 +1282,55 @@ def main():
                         'img_cx': (full_w / 2.0) - roi['x_min'],
                         'img_cy': (full_h / 2.0) - roi['y_min']
                     }
-                    log.info("Centro ROI: (%.1f, %.1f) px | Centro Immagine: (%.1f, %.1f) px",
+                    log.info("Centro ROI: (%.1f, %.1f) px | "
+                             "Centro Immagine: (%.1f, %.1f) px",
                              roi_center['roi_cx'], roi_center['roi_cy'],
                              roi_center['img_cx'], roi_center['img_cy'])
         else:
-            log.warning("Nessuna immagine Pointing mask_free trovata per ROI selection")
+            log.warning("Nessuna immagine Pointing mask_free "
+                        "trovata per ROI selection")
+
+        # ── Selezione interattiva ROI circolare per Top Imaging ──
+        roi_circle_top = None
+        first_ti_path = find_first_image_for_instrument(
+            df, 'Path_TopImaging')
+        if first_ti_path is not None:
+            img_ti_roi = safe_imread(first_ti_path)
+            if img_ti_roi is not None:
+                log.info("Selezione ROI circolare Top: %s",
+                         first_ti_path)
+                roi_circle_top = interactive_circular_roi_selection(
+                    img_ti_roi,
+                    title=f"Circular ROI — Top Imaging — "
+                          f"Day {target_date}"
+                )
+        else:
+            log.info("Nessuna immagine TopImaging trovata, "
+                     "ROI circolare saltata")
+
+        # Cartella debug per immagini diagnostiche
+        day_output = OUTPUT_DIR / target_date
+        debug_dir = day_output / 'debug' \
+            if RUN_MODE == "STEP_2_ANALYZE" else None
 
         # Fase 3
-        df = phase3_batch_process(df, roi=roi, run_mode=RUN_MODE)
+        df = phase3_batch_process(
+            df, roi=roi,
+            roi_circle_top=roi_circle_top,
+            run_mode=RUN_MODE,
+            debug_output_dir=debug_dir,
+        )
 
         # ── Output giornaliero ────────────────────────────────────────
         if RUN_MODE == "STEP_2_ANALYZE":
-            day_output = OUTPUT_DIR / target_date
             day_output.mkdir(parents=True, exist_ok=True)
 
             _save_csv(df, day_output / 'results_full.csv')
             _save_beam_debug(df, day_output)
             phase4_visualize(df, day_output, roi_center=roi_center)
 
-            log.info("Output giorno %s completato → %s", target_date, day_output)
+            log.info("Output giorno %s completato → %s",
+                     target_date, day_output)
         
         all_dfs.append(df)
 

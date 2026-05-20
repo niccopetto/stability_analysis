@@ -11,11 +11,19 @@ Tutte le funzioni accettano array NumPy e restituiscono dizionari Python.
 Dipendenze
 ----------
 - numpy
-- scipy (ndimage)
+- scipy (ndimage, optimize, special)
+- skimage (measure)
 """
+
+import logging
 
 import numpy as np
 from scipy import ndimage
+from scipy.optimize import curve_fit
+from scipy.special import voigt_profile
+from skimage.measure import find_contours
+
+log = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -485,69 +493,661 @@ def analyze_energy_spectrum(image_array: np.ndarray,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 5. PLASMA CHANNEL ANALYSIS
+# 5. PLASMA CHANNEL ANALYSIS — HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def analyze_plasma_channel(image_array: np.ndarray,
-                           threshold_fraction: float = 0.2) -> dict:
-    """Analizza il canale di plasma dall'immagine laterale (Side Imaging).
 
-    Identifica la "scintilla" di plasma nell'immagine laterale.
-    Calcola la posizione del centroide lungo l'asse di propagazione Z
-    e la lunghezza del plasma come numero di pixel che superano una
-    frazione dell'intensità massima.
+def _detect_nozzle_tip(raw_image: np.ndarray,
+                       contour_level_fraction: float = 0.15,
+                       intensity_upper_limit: float = None) -> dict | None:
+    """Detect the nozzle tip from a raw Side View image.
+
+    The nozzle appears as a dark shape with localised reflections,
+    touching the **bottom edge** of the image.  We use
+    ``skimage.measure.find_contours`` on the (optionally intensity-
+    clipped) raw image, keep only contours that reach the bottom
+    edge, and identify the tip as the topmost point (minimum Y).
 
     Parameters
     ----------
-    image_array : np.ndarray (2D)
-        Immagine dal Side Imaging (vista laterale del canale plasma).
-        Asse 0 = trasversale (Y), Asse 1 = propagazione (Z).
-    threshold_fraction : float, default 0.2
-        Frazione dell'intensità massima usata come soglia per definire
-        l'estensione del plasma (default: 20%).
+    raw_image : np.ndarray (2D)
+        Raw (non-background-subtracted) Side View image.
+    contour_level_fraction : float, default 0.15
+        Fraction of image maximum used as the contour level.
+    intensity_upper_limit : float or None
+        If set, pixel values above this are clipped **before**
+        contouring.  This prevents bright reflections on the nozzle
+        from producing spurious separate contours.
+
+    Returns
+    -------
+    dict or None
+        ``{'nozzle_contour', 'nozzle_tip_y', 'nozzle_tip_z'}``
+        or ``None`` if detection fails.
+    """
+    img = raw_image.astype(np.float64)
+    H = img.shape[0]
+
+    # Clip bright reflections to merge them with the nozzle body
+    if intensity_upper_limit is not None:
+        img = np.clip(img, 0, intensity_upper_limit)
+        log.debug("Nozzle detection: clipped intensities above %.1f",
+                  intensity_upper_limit)
+
+    max_val = float(np.max(img))
+    if max_val <= 0:
+        log.warning("Nozzle detection: image is empty (max=0)")
+        return None
+
+    contour_level = contour_level_fraction * max_val
+    log.debug("Nozzle detection: contour_level=%.2f (%.1f%% of max=%.1f)",
+              contour_level, contour_level_fraction * 100, max_val)
+
+    contours = find_contours(img, level=contour_level)
+    log.debug("Nozzle detection: found %d raw contours", len(contours))
+
+    if not contours:
+        log.warning("Nozzle detection: no contours at level=%.2f",
+                    contour_level)
+        return None
+
+    # Keep contours that touch the bottom edge (row >= H - 2)
+    bottom_contours = []
+    for i, c in enumerate(contours):
+        if np.any(c[:, 0] >= H - 2):
+            bottom_contours.append(c)
+            log.debug("  Contour %d: %d pts, touches bottom edge", i, len(c))
+
+    if not bottom_contours:
+        log.warning("Nozzle detection: no contours touch the bottom edge")
+        return None
+    log.debug("Nozzle detection: %d contours touch bottom",
+              len(bottom_contours))
+
+    # Select the largest contour (most vertices) as the nozzle
+    nozzle_contour = max(bottom_contours, key=len)
+    log.debug("Nozzle detection: selected contour with %d points",
+              len(nozzle_contour))
+
+    # Tip = point with minimum Y (topmost point, pointing up)
+    tip_idx = int(np.argmin(nozzle_contour[:, 0]))
+    nozzle_tip_y = float(nozzle_contour[tip_idx, 0])
+    nozzle_tip_z = float(nozzle_contour[tip_idx, 1])
+    log.info("Nozzle tip detected at (Z=%.1f, Y=%.1f) px",
+             nozzle_tip_z, nozzle_tip_y)
+
+    return {
+        'nozzle_contour': nozzle_contour,
+        'nozzle_tip_y': nozzle_tip_y,
+        'nozzle_tip_z': nozzle_tip_z,
+    }
+
+
+def _robust_z_profile(image: np.ndarray, percentile: float = 90) -> np.ndarray:
+    """Compute a hot-spot-immune 1D profile along Z.
+
+    Instead of summing or taking the max along Y (axis 0), this uses
+    the given percentile, which is robust to isolated bright pixels
+    while still capturing the true plasma signal.
+
+    Parameters
+    ----------
+    image : np.ndarray (2D)
+        Cleaned plasma image (float64).
+    percentile : float, default 90
+        Percentile to use.
+
+    Returns
+    -------
+    np.ndarray (1D)
+        One value per column (Z pixel).
+    """
+    return np.percentile(image.astype(np.float64), percentile, axis=0)
+
+
+def _voigt_model(x, center, sigma, gamma, amplitude, background):
+    """Voigt profile model for ``curve_fit``.
+
+    Parameters
+    ----------
+    x : array-like   — pixel coordinates (Y positions).
+    center : float   — profile centre.
+    sigma : float    — Gaussian width (>0).
+    gamma : float    — Lorentzian width (>0).
+    amplitude : float — peak amplitude.
+    background : float — constant offset.
+    """
+    return amplitude * voigt_profile(x - center, sigma, gamma) + background
+
+
+def _compute_centroid_with_errors(image: np.ndarray) -> dict:
+    """Compute 2D intensity-weighted centroid and its uncertainty.
+
+    The standard error on the centroid is estimated as:
+        ``σ_c = σ_spatial / sqrt(N_eff)``
+    where ``N_eff ≈ ΣI / I_max`` is the effective number of
+    independent intensity samples.
+
+    Parameters
+    ----------
+    image : np.ndarray (2D, float64, non-negative)
 
     Returns
     -------
     dict
-        - 'Plasma_Z_Position' : float — Centroide lungo Z (pixel).
-        - 'Plasma_Length'      : int — Lunghezza del plasma in pixel.
-        - 'Max_Intensity'      : float — Intensità massima del profilo Z.
-
-    Notes
-    -----
-    Il profilo lungo Z è ottenuto integrando l'immagine lungo l'asse
-    trasversale (somma sulle righe). La Plasma_Length conta il numero
-    di pixel il cui valore nel profilo integrato supera
-    threshold_fraction × max_intensity.
+        ``Y_c``, ``Z_c``           — centroid (px)
+        ``Y_c_err``, ``Z_c_err``   — standard errors (px)
+        ``Sigma_Y``, ``Sigma_Z``   — RMS widths (px)
+        ``total_intensity``        — ΣI
     """
-    img = image_array.astype(np.float64)
-
-    # Integrazione lungo l'asse trasversale (righe) → profilo 1D lungo Z
-    profile_z = np.sum(img, axis=0)
-
-    max_intensity = float(np.max(profile_z))
-
-    if max_intensity <= 0:
-        # Plasma_Length è NaN (float) nel caso degenere; pandas lo gestisce
-        # correttamente come valore mancante nella colonna int/float del DF.
+    total = float(np.sum(image))
+    if total <= 0:
         return {
-            'Plasma_Z_Position': np.nan,
-            'Plasma_Length': np.nan,
-            'Max_Intensity': 0.0
+            'Y_c': np.nan, 'Z_c': np.nan,
+            'Y_c_err': np.nan, 'Z_c_err': np.nan,
+            'Sigma_Y': np.nan, 'Sigma_Z': np.nan,
+            'total_intensity': 0.0,
         }
 
-    # Centroide pesato sull'intensità lungo Z
-    z_indices = np.arange(len(profile_z), dtype=np.float64)
-    total = np.sum(profile_z)
-    Plasma_Z_Position = float(np.sum(z_indices * profile_z) / total)
+    com = ndimage.center_of_mass(image)
+    Y_c, Z_c = float(com[0]), float(com[1])
 
-    # Lunghezza: conteggio pixel sopra la soglia frazionaria
-    threshold = threshold_fraction * max_intensity
-    above_threshold = profile_z >= threshold
-    Plasma_Length = int(np.sum(above_threshold))
+    rows, cols = np.indices(image.shape, dtype=np.float64)
+    Sigma_Y = float(np.sqrt(np.sum(image * (rows - Y_c) ** 2) / total))
+    Sigma_Z = float(np.sqrt(np.sum(image * (cols - Z_c) ** 2) / total))
+
+    max_int = float(np.max(image))
+    N_eff = max(total / max_int, 1.0) if max_int > 0 else 1.0
+
+    Y_c_err = Sigma_Y / np.sqrt(N_eff)
+    Z_c_err = Sigma_Z / np.sqrt(N_eff)
+
+    log.debug("Centroid: Z_c=%.2f±%.2f, Y_c=%.2f±%.2f, N_eff=%.0f",
+              Z_c, Z_c_err, Y_c, Y_c_err, N_eff)
 
     return {
-        'Plasma_Z_Position': Plasma_Z_Position,
-        'Plasma_Length': Plasma_Length,
-        'Max_Intensity': max_intensity
+        'Y_c': Y_c, 'Z_c': Z_c,
+        'Y_c_err': Y_c_err, 'Z_c_err': Z_c_err,
+        'Sigma_Y': Sigma_Y, 'Sigma_Z': Sigma_Z,
+        'total_intensity': total,
     }
+
+
+def _compute_plasma_length(profile_z: np.ndarray,
+                           threshold_fraction: float,
+                           virtual_peak: float) -> dict:
+    """Compute plasma length from a 1D Z profile with uncertainty.
+
+    The uncertainty is estimated by counting the pixels that lie
+    within ±5 % of the virtual peak from the threshold level
+    ("boundary pixels").
+
+    Returns
+    -------
+    dict
+        ``length``, ``length_err``, ``threshold``
+    """
+    threshold = threshold_fraction * virtual_peak
+    above = profile_z >= threshold
+    length = int(np.sum(above))
+
+    boundary_band = 0.05 * virtual_peak
+    boundary = np.abs(profile_z - threshold) < boundary_band
+    length_err = max(int(np.sum(boundary)), 1)
+
+    log.debug("Plasma length: %d px (err: ±%d px, threshold: %.2f)",
+              length, length_err, threshold)
+    return {'length': length, 'length_err': length_err,
+            'threshold': threshold}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5A. PLASMA CHANNEL — SIDE VIEW
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def analyze_plasma_channel_side(
+        cleaned_image: np.ndarray,
+        raw_image: np.ndarray = None,
+        threshold_fraction: float = 0.2,
+        contour_level_fraction: float = 0.15,
+        intensity_upper_limit: float = None,
+        px_to_mm: float = 1.0 / 179.0,
+        compute_length: bool = True) -> dict:
+    """Analyse the plasma channel from Side Imaging.
+
+    Workflow
+    --------
+    1. Compute a robust (90th-percentile) Z profile immune to hot
+       spots.
+    2. Always compute the 2D intensity-weighted centroid (Z_c, Y_c)
+       with uncertainty.
+    3. If a raw image is provided, detect the nozzle tip via
+       contouring and compute the **vertical distance** ΔY from
+       the nozzle tip to the plasma centroid.
+    4. If ``compute_length`` is True (i.e. the shot is NOT
+       filamented), compute the plasma length from the robust
+       profile.
+
+    Parameters
+    ----------
+    cleaned_image : np.ndarray (2D)
+        Background-subtracted Side Imaging image.
+        Axis 0 = transverse (Y), Axis 1 = propagation (Z).
+    raw_image : np.ndarray (2D) or None
+        Raw (un-subtracted) image for nozzle detection.
+    threshold_fraction : float
+        Fraction of the virtual peak for plasma-length thresholding.
+    contour_level_fraction : float
+        Fraction of the raw-image maximum for nozzle contouring.
+    intensity_upper_limit : float or None
+        Upper clip for nozzle contouring (prevents bright-reflection
+        artefacts).
+    px_to_mm : float
+        Pixel-to-mm conversion for Side Imaging.  Default is
+        1/179 ≈ 0.00559 mm/px (179 px = 1 mm).
+    compute_length : bool
+        If False (filamented shot), the plasma length is set to NaN.
+
+    Returns
+    -------
+    dict
+        Numeric results + ``'debug_data'`` sub-dict for visual
+        inspection.
+    """
+    log.info("── Side View analysis ──")
+    img = cleaned_image.astype(np.float64)
+
+    # ── 1. Robust Z profile ───────────────────────────────────────
+    profile_z_robust = _robust_z_profile(img)
+    virtual_peak = float(np.max(profile_z_robust))
+    log.debug("Virtual peak (90th pctl): %.2f", virtual_peak)
+
+    # Degenerate case
+    if virtual_peak <= 0:
+        log.warning("Side View: empty image (virtual_peak=0)")
+        return {
+            'Plasma_Z_Position': np.nan, 'Plasma_Z_Position_err': np.nan,
+            'Plasma_Z_Position_rel': np.nan,
+            'Plasma_Y_Position': np.nan, 'Plasma_Y_Position_err': np.nan,
+            'Plasma_Length': np.nan, 'Plasma_Length_err': np.nan,
+            'Max_Intensity': 0.0,
+            'Nozzle_Tip_Z': np.nan, 'Nozzle_Tip_Y': np.nan,
+            'Nozzle_Distance_Y': np.nan, 'Nozzle_Distance_Y_err': np.nan,
+            'Nozzle_Distance_Y_mm': np.nan,
+            'Nozzle_Distance_Y_mm_err': np.nan,
+            'debug_data': {
+                'nozzle_contour': None, 'nozzle_tip': None,
+                'z_profile_robust': profile_z_robust,
+            }
+        }
+
+    # ── 2. Centroid (always, even for filamented) ─────────────────
+    centroid = _compute_centroid_with_errors(img)
+    Z_c = centroid['Z_c']
+    Y_c = centroid['Y_c']
+    Z_c_err = centroid['Z_c_err']
+    Y_c_err = centroid['Y_c_err']
+    log.info("Plasma centroid: Z=%.1f±%.1f, Y=%.1f±%.1f px",
+             Z_c, Z_c_err, Y_c, Y_c_err)
+
+    # ── 3. Nozzle detection (from raw image) ──────────────────────
+    nozzle_tip_y = np.nan
+    nozzle_tip_z = np.nan
+    nozzle_contour = None
+    nozzle_tip = None
+
+    if raw_image is not None:
+        nozzle_res = _detect_nozzle_tip(
+            raw_image, contour_level_fraction, intensity_upper_limit
+        )
+        if nozzle_res is not None:
+            nozzle_tip_y = nozzle_res['nozzle_tip_y']
+            nozzle_tip_z = nozzle_res['nozzle_tip_z']
+            nozzle_contour = nozzle_res['nozzle_contour']
+            nozzle_tip = (nozzle_tip_z, nozzle_tip_y)
+        else:
+            log.warning("Side View: nozzle detection failed")
+    else:
+        log.warning("Side View: raw_image not provided, "
+                    "nozzle detection skipped")
+
+    # ── 4. Z position relative to nozzle ──────────────────────────
+    Z_pos_rel = np.nan
+    if not np.isnan(nozzle_tip_z):
+        Z_pos_rel = (Z_c - nozzle_tip_z) * px_to_mm
+        log.info("Z relative to nozzle: %.3f mm", Z_pos_rel)
+
+    # ── 5. Vertical distance ΔY (pure height, no diagonal) ───────
+    nozzle_dist_y = np.nan
+    nozzle_dist_y_err = np.nan
+    nozzle_dist_y_mm = np.nan
+    nozzle_dist_y_mm_err = np.nan
+
+    if not np.isnan(nozzle_tip_y):
+        nozzle_dist_y = abs(Y_c - nozzle_tip_y)
+        nozzle_tip_err_px = 1.0          # ≈1 px uncertainty on tip
+        nozzle_dist_y_err = float(
+            np.sqrt(Y_c_err ** 2 + nozzle_tip_err_px ** 2)
+        )
+        nozzle_dist_y_mm = nozzle_dist_y * px_to_mm
+        nozzle_dist_y_mm_err = nozzle_dist_y_err * px_to_mm
+        log.info("Nozzle distance (ΔY): %.1f±%.1f px = "
+                 "%.3f±%.3f mm",
+                 nozzle_dist_y, nozzle_dist_y_err,
+                 nozzle_dist_y_mm, nozzle_dist_y_mm_err)
+
+    # ── 6. Plasma length (skipped for filamented) ─────────────────
+    plasma_length = np.nan
+    plasma_length_err = np.nan
+
+    if compute_length:
+        lres = _compute_plasma_length(
+            profile_z_robust, threshold_fraction, virtual_peak
+        )
+        plasma_length = lres['length']
+        plasma_length_err = lres['length_err']
+    else:
+        log.info("Plasma length skipped (filamented shot)")
+
+    return {
+        'Plasma_Z_Position': Z_c,
+        'Plasma_Z_Position_err': Z_c_err,
+        'Plasma_Z_Position_rel': Z_pos_rel,
+        'Plasma_Y_Position': Y_c,
+        'Plasma_Y_Position_err': Y_c_err,
+        'Plasma_Length': plasma_length,
+        'Plasma_Length_err': plasma_length_err,
+        'Max_Intensity': virtual_peak,
+        'Nozzle_Tip_Z': nozzle_tip_z,
+        'Nozzle_Tip_Y': nozzle_tip_y,
+        'Nozzle_Distance_Y': nozzle_dist_y,
+        'Nozzle_Distance_Y_err': nozzle_dist_y_err,
+        'Nozzle_Distance_Y_mm': nozzle_dist_y_mm,
+        'Nozzle_Distance_Y_mm_err': nozzle_dist_y_mm_err,
+        'debug_data': {
+            'nozzle_contour': nozzle_contour,
+            'nozzle_tip': nozzle_tip,
+            'z_profile_robust': profile_z_robust,
+        }
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5B. PLASMA CHANNEL — TOP VIEW
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def analyze_plasma_channel_top(
+        cleaned_image: np.ndarray,
+        threshold_fraction: float = 0.2,
+        saturation_value: float = 255.0,
+        voigt_margin_px: int = 18,
+        voigt_center_tol_px: float = 3.0,
+        px_to_mm: float = 1.0,
+        compute_length: bool = True) -> dict:
+    """Analyse the plasma channel from Top Imaging.
+
+    The image typically exhibits strong central saturation (pixels
+    clipped at ``saturation_value``) surrounded by diffraction /
+    scattering rings.  A coarse-to-fine strategy is used to recover
+    the transverse axis position even inside the saturated plateau:
+
+    * **Coarse:** geometric midpoint of the saturated zone.
+    * **Fine:**  Voigt fit on the wings (excluding the plateau),
+      constrained around the coarse estimate.
+
+    Parameters
+    ----------
+    cleaned_image : np.ndarray (2D)
+        Background-subtracted Top Imaging image.
+    threshold_fraction : float
+        Fraction of the virtual peak for length thresholding.
+    saturation_value : float
+        ADC saturation value (255 for 8-bit cameras).
+    voigt_margin_px : int
+        Number of pixels beyond the plateau edges to include in
+        the fitting window.
+    voigt_center_tol_px : float
+        Allowed deviation of the Voigt centre from the coarse
+        midpoint (bounds for ``curve_fit``).
+    px_to_mm : float
+        Pixel-to-mm conversion for Top Imaging.  Default 1.0
+        (uncalibrated; update when calibration is known).
+    compute_length : bool
+        If False (filamented shot), length is NaN.
+
+    Returns
+    -------
+    dict
+        Numeric results + ``'debug_data'`` with fit details.
+    """
+    log.info("── Top View analysis ──")
+    img = cleaned_image.astype(np.float64)
+    n_rows, n_cols = img.shape
+
+    # ── 1. Robust Z profile ───────────────────────────────────────
+    profile_z_robust = _robust_z_profile(img)
+    virtual_peak = float(np.max(profile_z_robust))
+    log.debug("Virtual peak (90th pctl): %.2f", virtual_peak)
+
+    if virtual_peak <= 0:
+        log.warning("Top View: empty image (virtual_peak=0)")
+        return {
+            'Plasma_Z_Position': np.nan, 'Plasma_Z_Position_err': np.nan,
+            'Plasma_Y_Position': np.nan, 'Plasma_Y_Position_err': np.nan,
+            'Plasma_Length': np.nan, 'Plasma_Length_err': np.nan,
+            'Max_Intensity': 0.0,
+            'debug_data': {
+                'z_profile_robust': profile_z_robust,
+                'axis_coords': (np.array([]), np.array([])),
+                'axis_coords_err': np.array([]),
+                'voigt_params_log': [],
+            }
+        }
+
+    # ── 2. Centroid (always) ──────────────────────────────────────
+    centroid = _compute_centroid_with_errors(img)
+    Z_c = centroid['Z_c']
+    Y_c = centroid['Y_c']
+    Z_c_err = centroid['Z_c_err']
+    Y_c_err = centroid['Y_c_err']
+    log.info("Plasma centroid: Z=%.1f±%.1f, Y=%.1f±%.1f px",
+             Z_c, Z_c_err, Y_c, Y_c_err)
+
+    # ── 3. Plasma length (skipped for filamented) ─────────────────
+    plasma_length = np.nan
+    plasma_length_err = np.nan
+    if compute_length:
+        lres = _compute_plasma_length(
+            profile_z_robust, threshold_fraction, virtual_peak
+        )
+        plasma_length = lres['length']
+        plasma_length_err = lres['length_err']
+    else:
+        log.info("Plasma length skipped (filamented shot)")
+
+    # ── 4. Coarse-to-Fine transverse axis extraction ──────────────
+    threshold = threshold_fraction * virtual_peak
+    active_cols = np.where(profile_z_robust >= threshold)[0]
+
+    axis_z_list = []
+    axis_y_list = []
+    axis_y_err_list = []
+    voigt_params_log = []
+
+    sat_thresh = saturation_value - 1.0   # ≥ this → saturated
+
+    for z in active_cols:
+        col_profile = img[:, z]
+
+        # — Coarse: find saturated plateau —
+        saturated = col_profile >= sat_thresh
+        sat_indices = np.where(saturated)[0]
+
+        if len(sat_indices) >= 3:
+            y_start = int(sat_indices[0])
+            y_end = int(sat_indices[-1])
+            y_mid = (y_start + y_end) / 2.0
+
+            # — Fine: Voigt fit on wings only —
+            win_lo = max(y_start - voigt_margin_px, 0)
+            win_hi = min(y_end + voigt_margin_px + 1, n_rows)
+            y_coords = np.arange(win_lo, win_hi, dtype=np.float64)
+            data = col_profile[win_lo:win_hi]
+
+            # Mask: True = use this pixel, False = saturated → skip
+            mask = data < sat_thresh
+            y_fit = y_coords[mask]
+            d_fit = data[mask]
+
+            fit_center = y_mid
+            fit_center_err = np.nan
+            fit_params_dict = None
+
+            if len(y_fit) >= 5:
+                try:
+                    wing_max = float(np.max(d_fit)) if len(d_fit) > 0 else 1.0
+                    p0 = [y_mid, 2.0, 1.0, wing_max, 0.0]
+                    bounds_lo = [y_mid - voigt_center_tol_px, 0.1, 0.01,
+                                 0.0, -np.inf]
+                    bounds_hi = [y_mid + voigt_center_tol_px, 30.0, 30.0,
+                                 np.inf, np.inf]
+
+                    popt, pcov = curve_fit(
+                        _voigt_model, y_fit, d_fit,
+                        p0=p0, bounds=(bounds_lo, bounds_hi),
+                        maxfev=2000
+                    )
+                    perr = np.sqrt(np.diag(pcov))
+
+                    fit_center = popt[0]
+                    fit_center_err = perr[0]
+
+                    fit_params_dict = {
+                        'center': popt[0], 'center_err': perr[0],
+                        'sigma': popt[1], 'sigma_err': perr[1],
+                        'gamma': popt[2], 'gamma_err': perr[2],
+                        'amplitude': popt[3], 'amplitude_err': perr[3],
+                        'background': popt[4], 'background_err': perr[4],
+                    }
+                    log.debug(
+                        "Z=%d Voigt fit: center=%.2f±%.2f, "
+                        "σ=%.3f±%.3f, γ=%.3f±%.3f, "
+                        "A=%.1f±%.1f, bg=%.1f±%.1f",
+                        z, popt[0], perr[0],
+                        popt[1], perr[1], popt[2], perr[2],
+                        popt[3], perr[3], popt[4], perr[4],
+                    )
+                except (RuntimeError, ValueError) as e:
+                    log.debug("Z=%d Voigt fit failed (%s), "
+                              "using coarse midpoint %.1f", z, e, y_mid)
+                    fit_center = y_mid
+                    # Coarse error ≈ half plateau width
+                    fit_center_err = (y_end - y_start) / 2.0
+            else:
+                log.debug("Z=%d too few wing pixels (%d), "
+                          "using coarse midpoint %.1f",
+                          z, len(y_fit), y_mid)
+                fit_center_err = (y_end - y_start) / 2.0
+
+        else:
+            # No saturation in this column → simple weighted centroid
+            total_col = float(np.sum(col_profile))
+            if total_col > 0:
+                y_indices = np.arange(n_rows, dtype=np.float64)
+                fit_center = float(
+                    np.sum(y_indices * col_profile) / total_col
+                )
+                # Error ≈ σ / sqrt(N_eff)
+                sigma_col = float(np.sqrt(
+                    np.sum(col_profile * (y_indices - fit_center) ** 2)
+                    / total_col
+                ))
+                max_col = float(np.max(col_profile))
+                n_eff_col = max(total_col / max_col, 1.0) \
+                    if max_col > 0 else 1.0
+                fit_center_err = sigma_col / np.sqrt(n_eff_col)
+            else:
+                fit_center = np.nan
+                fit_center_err = np.nan
+            fit_params_dict = None
+
+        axis_z_list.append(z)
+        axis_y_list.append(fit_center)
+        axis_y_err_list.append(fit_center_err)
+        voigt_params_log.append({
+            'z': z,
+            'y_center': fit_center,
+            'y_center_err': fit_center_err,
+            'params': fit_params_dict,
+        })
+
+    axis_z = np.array(axis_z_list, dtype=np.float64)
+    axis_y = np.array(axis_y_list, dtype=np.float64)
+    axis_y_err = np.array(axis_y_err_list, dtype=np.float64)
+
+    log.info("Top View axis extracted: %d columns analysed",
+             len(axis_z))
+
+    return {
+        'Plasma_Z_Position': Z_c,
+        'Plasma_Z_Position_err': Z_c_err,
+        'Plasma_Y_Position': Y_c,
+        'Plasma_Y_Position_err': Y_c_err,
+        'Plasma_Length': plasma_length,
+        'Plasma_Length_err': plasma_length_err,
+        'Max_Intensity': virtual_peak,
+        'debug_data': {
+            'z_profile_robust': profile_z_robust,
+            'axis_coords': (axis_z, axis_y),
+            'axis_coords_err': axis_y_err,
+            'voigt_params_log': voigt_params_log,
+        }
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5C. PLASMA CHANNEL — BACKWARD-COMPATIBLE DISPATCHER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def analyze_plasma_channel(image_array: np.ndarray,
+                           threshold_fraction: float = 0.2,
+                           is_top_view: bool = False,
+                           raw_image: np.ndarray = None,
+                           **kwargs) -> dict:
+    """Dispatch to the appropriate plasma-channel analysis.
+
+    This wrapper preserves backward compatibility with existing code.
+
+    * ``is_top_view=False`` → :func:`analyze_plasma_channel_side`
+    * ``is_top_view=True``  → :func:`analyze_plasma_channel_top`
+
+    Parameters
+    ----------
+    image_array : np.ndarray (2D)
+        Cleaned (background-subtracted) plasma image.
+    threshold_fraction : float
+        Fraction of the virtual peak used for thresholding.
+    is_top_view : bool
+        Select Top View analysis when True.
+    raw_image : np.ndarray (2D) or None
+        Raw image for nozzle detection (Side View only).
+    **kwargs
+        Forwarded to the selected implementation.
+
+    Returns
+    -------
+    dict — see ``analyze_plasma_channel_side`` or
+    ``analyze_plasma_channel_top``.
+    """
+    if is_top_view:
+        return analyze_plasma_channel_top(
+            image_array, threshold_fraction=threshold_fraction, **kwargs
+        )
+    else:
+        if raw_image is None:
+            log.warning("Side View: raw_image not provided, "
+                        "nozzle detection will be disabled")
+        return analyze_plasma_channel_side(
+            image_array, raw_image=raw_image,
+            threshold_fraction=threshold_fraction, **kwargs
+        )
