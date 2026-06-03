@@ -516,86 +516,6 @@ def phase1_ingest_excel(excel_path: Path) -> pd.DataFrame:
         df['Pointing_State'] = np.nan
         log.warning("Colonna 'General_Comments' non trovata: le variabili di stato saranno NaN")
 
-    # ── Colonne Motore: Z-height e Y-Focus ──────────────────────────
-    # Cerca le colonne motore con pattern matching (gestisce variazioni
-    # di spaziatura/capitalizzazione tra i diversi file Excel).
-    z_height_col = None
-    y_focus_col = None
-    for c in df.columns:
-        c_lower = str(c).lower()
-        if 'height' in c_lower and 'z' in c_lower:
-            z_height_col = c
-        if 'focus' in c_lower and 'y' in c_lower:
-            y_focus_col = c
-
-    if z_height_col is not None and y_focus_col is not None:
-        # Rinomina in nomi interni standardizzati
-        df.rename(columns={z_height_col: 'Z_height_mm',
-                           y_focus_col: 'Y_Focus_mm'}, inplace=True)
-        log.info("Colonne motore trovate: '%s' → Z_height_mm, '%s' → Y_Focus_mm",
-                 z_height_col, y_focus_col)
-
-        # Converti a numerico e forward-fill (propagazione valori)
-        df['Z_height_mm'] = pd.to_numeric(df['Z_height_mm'], errors='coerce')
-        df['Y_Focus_mm'] = pd.to_numeric(df['Y_Focus_mm'], errors='coerce')
-        df['Z_height_mm'] = df['Z_height_mm'].ffill()
-        df['Y_Focus_mm'] = df['Y_Focus_mm'].ffill()
-
-        # ── Punto Zero: primo shot mask_free con valori motore validi ──
-        z_nozzle_0 = np.nan
-        y_focus_0 = np.nan
-
-        if 'Tipo_Maschera' in df.columns:
-            mask_free_mask = (
-                (df['Tipo_Maschera'] == 'free') &
-                (df['Z_height_mm'].notna()) &
-                (df['Y_Focus_mm'].notna())
-            )
-            mask_free_shots = df[mask_free_mask]
-            if not mask_free_shots.empty:
-                ref_shot = mask_free_shots.index[0]
-                z_nozzle_0 = df.at[ref_shot, 'Z_height_mm']
-                y_focus_0 = df.at[ref_shot, 'Y_Focus_mm']
-                log.info("Punto Zero (shot %s): Z_height_0=%.3f mm, "
-                         "Y_Focus_0=%.3f mm", ref_shot, z_nozzle_0, y_focus_0)
-            else:
-                log.warning("Nessuno shot mask_free con valori motore validi "
-                            "trovato — Delta_* saranno 0.0")
-        else:
-            log.warning("Tipo_Maschera non disponibile — "
-                        "impossibile trovare il Punto Zero")
-
-        # Se il Punto Zero non è stato trovato, usa 0.0 (nessuna correzione)
-        if np.isnan(z_nozzle_0):
-            z_nozzle_0 = df['Z_height_mm'].iloc[0] if df['Z_height_mm'].notna().any() else 0.0
-            log.info("Punto Zero fallback (primo valore): Z_height_0=%.3f mm", z_nozzle_0)
-        if np.isnan(y_focus_0):
-            y_focus_0 = df['Y_Focus_mm'].iloc[0] if df['Y_Focus_mm'].notna().any() else 0.0
-            log.info("Punto Zero fallback (primo valore): Y_Focus_0=%.3f mm", y_focus_0)
-
-        # ── Delta motore (spostamenti relativi) ──
-        df['Delta_Z_motor'] = df['Z_height_mm'] - z_nozzle_0
-        df['Delta_Y_motor'] = df['Y_Focus_mm'] - y_focus_0
-
-        # Salva i riferimenti come metadati del DataFrame
-        df.attrs['z_nozzle_0'] = z_nozzle_0
-        df.attrs['y_focus_0'] = y_focus_0
-
-        n_scans = (df['Delta_Y_motor'].abs() > 1e-6).sum()
-        log.info("Delta motore calcolati: %d shot con focal scan attivo "
-                 "(Delta_Y_motor ≠ 0)", n_scans)
-        log.info("  Delta_Z_motor range: [%.3f, %.3f] mm",
-                 df['Delta_Z_motor'].min(), df['Delta_Z_motor'].max())
-        log.info("  Delta_Y_motor range: [%.3f, %.3f] mm",
-                 df['Delta_Y_motor'].min(), df['Delta_Y_motor'].max())
-    else:
-        # Colonne motore non trovate → Delta = 0 (nessuna correzione)
-        df['Z_height_mm'] = np.nan
-        df['Y_Focus_mm'] = np.nan
-        df['Delta_Z_motor'] = 0.0
-        df['Delta_Y_motor'] = 0.0
-        log.warning("Colonne motore non trovate nell'Excel — "
-                    "Delta_Z_motor e Delta_Y_motor impostati a 0.0")
 
     n_masks = df['Tipo_Maschera'].notna().sum()
     log.info("Tipo_Maschera assegnato a %d/%d shot", n_masks, len(df))
@@ -761,9 +681,6 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
         'Nozzle_Distance_Y_mm', 'Nozzle_Distance_Y_mm_err',
         'Side_Beam_Angle_mrad', 'Side_Beam_Angle_mrad_err',
         'Side_Channel_Width_mean', 'Side_Saturated_Length',
-        # Side View — Focal Scan Corrections
-        'Plasma_Z_Position_rel_to_focus',
-        'Plasma_Y_centroid_rel_to_nozzle',
         # Top View
         'Top_Plasma_Z_Position', 'Top_Plasma_Z_Position_err',
         'Top_Plasma_Y_Position', 'Top_Plasma_Y_Position_err',
@@ -772,8 +689,6 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
         'Top_Max_Intensity',
         'Top_Beam_Angle_mrad', 'Top_Beam_Angle_mrad_err',
         'Top_Channel_Width_mean',
-        # Top View — Focal Scan Corrections
-        'Top_Plasma_Z_Position_rel_to_focus',
         # Pointing
         'N_Blobs', 'Compactness',
         'X_c', 'Y_c', 'Sigma_X', 'Sigma_Y', 'Total_Intensity',
@@ -870,22 +785,6 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
                         df.at[shot, 'Side_Channel_Width_mean'] = res_si['Side_Channel_Width_mean']
                         df.at[shot, 'Side_Saturated_Length'] = res_si['Side_Saturated_Length']
 
-                        # ── Focal scan correction (Side) ──────────
-                        delta_y = df.at[shot, 'Delta_Y_motor'] \
-                            if 'Delta_Y_motor' in df.columns else 0.0
-                        delta_z = df.at[shot, 'Delta_Z_motor'] \
-                            if 'Delta_Z_motor' in df.columns else 0.0
-
-                        z_rel = df.at[shot, 'Plasma_Z_Position_rel']
-                        if pd.notna(z_rel) and pd.notna(delta_y):
-                            df.at[shot, 'Plasma_Z_Position_rel_to_focus'] = \
-                                z_rel - delta_y
-
-                        y_dist = df.at[shot, 'Nozzle_Distance_Y_mm']
-                        if pd.notna(y_dist) and pd.notna(delta_z):
-                            df.at[shot, 'Plasma_Y_centroid_rel_to_nozzle'] = \
-                                y_dist - delta_z
-
                         # Debug image (primi N shot)
                         if debug_output_dir is not None \
                                 and debug_saved_side < debug_max_shots:
@@ -946,20 +845,6 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
                             df.at[shot, 'Top_Beam_Angle_mrad'] = res_ti['Top_Beam_Angle_mrad']
                             df.at[shot, 'Top_Beam_Angle_mrad_err'] = res_ti['Top_Beam_Angle_mrad_err']
                             df.at[shot, 'Top_Channel_Width_mean'] = res_ti['Top_Channel_Width_mean']
-
-                            # ── Focal scan correction (Top) ──────────
-                            # NOTA: Top_Plasma_Z_Position è in pixel
-                            # (PX_TO_MM_TOP non calibrato = 1.0).
-                            # I risultati saranno validi solo dopo la
-                            # calibrazione del fattore PX_TO_MM_TOP.
-                            delta_y_top = df.at[shot, 'Delta_Y_motor'] \
-                                if 'Delta_Y_motor' in df.columns else 0.0
-
-                            top_z_px = res_ti['Plasma_Z_Position']
-                            if pd.notna(top_z_px) and pd.notna(delta_y_top):
-                                top_z_mm = top_z_px * PX_TO_MM_TOP
-                                df.at[shot, 'Top_Plasma_Z_Position_rel_to_focus'] = \
-                                    top_z_mm - delta_y_top
 
                             # Debug image (primi N shot)
                             if debug_output_dir is not None \
