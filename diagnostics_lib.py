@@ -21,7 +21,7 @@ import numpy as np
 from scipy import ndimage
 from scipy.optimize import curve_fit
 from scipy.special import voigt_profile
-from skimage.measure import find_contours
+import cv2
 
 log = logging.getLogger(__name__)
 
@@ -59,36 +59,6 @@ def subtract_background(image_array: np.ndarray, bg_array: np.ndarray) -> dict:
     cleaned = image_array.astype(np.float64) - bg_array.astype(np.float64)
     cleaned = np.clip(cleaned, 0, None)
     return {'cleaned_image': cleaned}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2. LANEX STATUS CHECK
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def check_lanex_status(image_array: np.ndarray, noise_threshold: float) -> dict:
-    """Determina se il Lanex screen è inserito (IN) o estratto (OUT).
-
-    Calcola la somma totale dei pixel dell'immagine. Se questa supera
-    la soglia specificata, il Lanex è considerato inserito (stato IN),
-    indicando la presenza di un segnale di scintillazione.
-
-    Parameters
-    ----------
-    image_array : np.ndarray (2D)
-        Immagine dal Lanex screen (già pulita dal background).
-    noise_threshold : float
-        Soglia di conteggi totali per discriminare segnale da rumore.
-        Valori tipici dipendono dalla camera e dall'esposizione.
-
-    Returns
-    -------
-    dict
-        - 'is_in'        : bool — True se il Lanex è IN (segnale presente).
-        - 'total_counts'  : float — Somma totale dei pixel.
-    """
-    total = float(np.sum(image_array.astype(np.float64)))
-    is_in = total > noise_threshold
-    return {'is_in': is_in, 'total_counts': total}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -497,116 +467,6 @@ def analyze_energy_spectrum(image_array: np.ndarray,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _detect_nozzle_tip(raw_image: np.ndarray,
-                       contour_level_fraction: float = 0.15,
-                       intensity_upper_limit: float = None) -> dict | None:
-    """Detect the nozzle tip from a raw Side View image.
-
-    The nozzle appears as a dark shape with localised reflections,
-    touching the **bottom edge** of the image.  We use
-    ``skimage.measure.find_contours`` on the (optionally intensity-
-    clipped) raw image, keep only contours that reach the bottom
-    edge, and identify the tip as the topmost point (minimum Y).
-
-    Parameters
-    ----------
-    raw_image : np.ndarray (2D)
-        Raw (non-background-subtracted) Side View image.
-    contour_level_fraction : float, default 0.15
-        Fraction of image maximum used as the contour level.
-    intensity_upper_limit : float or None
-        If set, pixel values above this are clipped **before**
-        contouring.  This prevents bright reflections on the nozzle
-        from producing spurious separate contours.
-
-    Returns
-    -------
-    dict or None
-        ``{'nozzle_contour', 'nozzle_tip_y', 'nozzle_tip_z'}``
-        or ``None`` if detection fails.
-    """
-    img = raw_image.astype(np.float64)
-    H, W = img.shape
-
-    # 1. Find the horizontal bright reflection strip that marks the nozzle tip
-    center_x = slice(W // 4, 3 * W // 4)
-    img_center = img[:, center_x]
-    p95 = np.percentile(img, 95)
-    bright_pixels = img_center > p95
-    bright_row_counts = np.sum(bright_pixels, axis=1)
-
-    # Search region for the nozzle tip (between Y=500 and Y=1800)
-    search_region = bright_row_counts[500:1800]
-    if len(search_region) > 0 and np.max(search_region) > 50:
-        peak_y_local = int(np.argmax(search_region))
-        tip_y_est = 500 + peak_y_local
-    else:
-        tip_y_est = H // 2
-
-    log.debug("Nozzle detection: found reflection strip at Y=%d", tip_y_est)
-
-    # 2. Clip hot pixels/reflections at the 99th percentile for contouring
-    p99 = np.percentile(img, 99)
-    img_clipped = np.clip(img, 0, p99)
-
-    # Mask everything above the reflection strip so we don't trace the gas plume
-    img_clipped[:tip_y_est, :] = p99
-
-    max_val = float(np.max(img_clipped))
-    if max_val <= 0:
-        log.warning("Nozzle detection: image is empty (max=0)")
-        return None
-
-    # The nozzle is a shadow. Using 50% of the clipped maximum reliably
-    # traces the boundary between the dark shadow and the background.
-    contour_level = 0.5 * max_val
-    log.debug("Nozzle detection: contour_level=%.2f (50%% of clipped max=%.1f)",
-              contour_level, max_val)
-
-    contours = find_contours(img_clipped, level=contour_level)
-    log.debug("Nozzle detection: found %d raw contours", len(contours))
-
-    if not contours:
-        log.warning("Nozzle detection: no contours at level=%.2f",
-                    contour_level)
-        return None
-
-    # Keep contours that touch the bottom edge (row >= H - 2)
-    bottom_contours = []
-    for i, c in enumerate(contours):
-        if np.any(c[:, 0] >= H - 10):
-            bottom_contours.append(c)
-            log.debug("  Contour %d: %d pts, touches bottom edge", i, len(c))
-
-    if not bottom_contours:
-        log.warning("Nozzle detection: no contours touch the bottom edge")
-        return None
-    log.debug("Nozzle detection: %d contours touch bottom",
-              len(bottom_contours))
-
-    # Select the largest contour (most vertices) as the nozzle
-    nozzle_contour = max(bottom_contours, key=len)
-    log.debug("Nozzle detection: selected contour with %d points",
-              len(nozzle_contour))
-
-    # Tip = point with minimum Y (topmost point, pointing up)
-    tip_idx = int(np.argmin(nozzle_contour[:, 0]))
-    contour_tip_y = float(nozzle_contour[tip_idx, 0])
-    nozzle_tip_z = float(nozzle_contour[tip_idx, 1])
-    
-    # The actual tip Y is the reflection strip, or the contour tip if it's lower
-    nozzle_tip_y = min(contour_tip_y, float(tip_y_est))
-    
-    log.info("Nozzle tip detected at (Z=%.1f, Y=%.1f) px",
-             nozzle_tip_z, nozzle_tip_y)
-
-    return {
-        'nozzle_contour': nozzle_contour,
-        'nozzle_tip_y': nozzle_tip_y,
-        'nozzle_tip_z': nozzle_tip_z,
-    }
-
-
 def _robust_z_profile(image: np.ndarray, percentile: float = 99.5) -> np.ndarray:
     """Compute a hot-spot-immune 1D profile along Z.
 
@@ -981,85 +841,43 @@ def _extract_transverse_axis(
 
 def analyze_plasma_channel_side(
         cleaned_image: np.ndarray,
-        raw_image: np.ndarray = None,
-        threshold_fraction: float = 0.2,
-        contour_level_fraction: float = 0.15,
-        intensity_upper_limit: float = None,
-        saturation_value: float = 255.0,
-        fwhm_fraction_saturated: float = 0.8,
-        fwhm_fraction_unsaturated: float = 0.5,
-        smoothing_sigma: float = 1.0,
-        px_to_mm: float = 1.0 / 179.0,
-        compute_length: bool = True) -> dict:
-    """Analyse the plasma channel from Side Imaging.
+        interactive_roi: tuple = None,
+        threshold_fraction: float = 0.05,
+        px_to_mm: float = 1.0 / 179.0) -> dict:
+    """Analyse the plasma channel from Side Imaging using interactive ROI.
 
-    Uses the same column-by-column transverse axis extraction
-    technique as the Top View, providing:
-
-    * A precise Y(Z) trajectory of the plasma channel.
-    * The **mean height** of the channel axis for computing the
-      distance to the nozzle tip (``Nozzle_Distance_Y``).
-    * A contiguous plasma length measurement.
-    * Channel width (FWHM) statistics along the propagation axis.
-    * Beam entrance angle from a linear fit on the axis.
-
-    Workflow
-    --------
-    1. Compute a robust (99.5th-percentile) Z profile.
-    2. Detect the nozzle tip from the raw image.
-    3. Compute the contiguous plasma length.
-    4. Extract the transverse axis column-by-column (shared helper).
-    5. Compute the mean channel height Y and the distance to
-       the nozzle (using the mean Y of the axis).
-    6. Perform a linear fit on the axis to extract tilt angle.
+    Uses OpenCV connected components to identify plasma blobs within the
+    interactive ROI, extracts the geometric axis by computing the mean Y
+    for each Z column, and fits a linear model to determine the beam angle.
 
     Parameters
     ----------
     cleaned_image : np.ndarray (2D)
         Background-subtracted Side Imaging image.
-        Axis 0 = transverse (Y), Axis 1 = propagation (Z).
-    raw_image : np.ndarray (2D) or None
-        Raw (un-subtracted) image for nozzle detection.
-    threshold_fraction : float
-        Fraction of the virtual peak for plasma-length thresholding.
-    contour_level_fraction : float
-        Fraction of the raw-image maximum for nozzle contouring.
-    intensity_upper_limit : float or None
-        Upper clip for nozzle contouring (prevents bright-reflection
-        artefacts).
-    saturation_value : float
-        ADC saturation value (default 255 for 8-bit cameras).
-    fwhm_fraction_saturated : float
-        Fraction of ``saturation_value`` for FWHM in saturated cols.
-    fwhm_fraction_unsaturated : float
-        Fraction of peak for FWHM in unsaturated columns.
-    smoothing_sigma : float
-        Gaussian σ for smoothing unsaturated profiles.
-    px_to_mm : float
-        Pixel-to-mm conversion for Side Imaging.  Default is
-        1/179 ≈ 0.00559 mm/px (179 px = 1 mm).
-    compute_length : bool
-        If False (filamented shot), the plasma length is set to NaN.
+    interactive_roi : tuple of (x, y, w, h) or None
+        ROI rectangle in pixel coordinates.  If None, analysis is skipped
+        and all-NaN results are returned.
+    threshold_fraction : float, default 0.05
+        Fraction of the ROI maximum intensity used for blob thresholding.
+    px_to_mm : float, default 1.0/179.0
+        Pixel-to-mm conversion factor for Side Imaging.
 
     Returns
     -------
     dict
-        Numeric results + ``'debug_data'`` sub-dict for visual
-        inspection.
+        Numeric results including plasma position, length, beam angle,
+        nozzle distance, and a ``'debug_data'`` sub-dict with axis
+        coordinates, ROI info, blob mask, and fit coefficients.
     """
-    log.info("── Side View analysis (axis extraction) ──")
+    log.info("── Side View analysis (geometric blob extraction) ──")
     img = cleaned_image.astype(np.float64)
 
-    # ── 1. Robust Z profile ───────────────────────────────────────
-    profile_z_robust = _robust_z_profile(img)
-    virtual_peak = float(np.max(profile_z_robust))
-    log.debug("Virtual peak (99.5th pctl): %.2f", virtual_peak)
-
-    # NaN result template
     nan_result = {
         'Plasma_Z_Position': np.nan, 'Plasma_Z_Position_err': np.nan,
         'Plasma_Z_Position_rel': np.nan,
         'Plasma_Y_Position': np.nan, 'Plasma_Y_Position_err': np.nan,
+        'Plasma_Z_Centroid': np.nan, 'Plasma_Z_Centroid_err': np.nan,
+        'Plasma_Y_Centroid': np.nan, 'Plasma_Y_Centroid_err': np.nan,
         'Plasma_Length': np.nan, 'Plasma_Length_err': np.nan,
         'Plasma_Length_mm': np.nan, 'Plasma_Length_mm_err': np.nan,
         'Max_Intensity': 0.0,
@@ -1072,186 +890,121 @@ def analyze_plasma_channel_side(
         'Side_Channel_Width_mean': np.nan,
         'Side_Saturated_Length': np.nan,
         'debug_data': {
-            'nozzle_contour': None, 'nozzle_tip': None,
-            'z_profile_robust': profile_z_robust,
             'axis_coords': (np.array([]), np.array([])),
-            'axis_coords_err': np.array([]),
-            'axis_width': np.array([]),
-            'axis_y_left': np.array([]),
-            'axis_y_right': np.array([]),
+            'interactive_roi': interactive_roi,
+            'interactive_mask': None,
+            'fit_coeffs': None
         }
     }
 
-    # Degenerate case
-    if virtual_peak <= 0:
-        log.warning("Side View: empty image (virtual_peak=0)")
+    if interactive_roi is None:
+        log.warning("Side View: No interactive ROI provided. Skipping analysis.")
         return nan_result
 
-    # ── 2. Nozzle detection (from raw image) ──────────────────────
-    nozzle_tip_y = np.nan
-    nozzle_tip_z = np.nan
-    nozzle_contour = None
-    nozzle_tip = None
-
-    if raw_image is not None:
-        nozzle_res = _detect_nozzle_tip(
-            raw_image, contour_level_fraction, intensity_upper_limit
-        )
-        if nozzle_res is not None:
-            nozzle_tip_y = nozzle_res['nozzle_tip_y']
-            nozzle_tip_z = nozzle_res['nozzle_tip_z']
-            nozzle_contour = nozzle_res['nozzle_contour']
-            nozzle_tip = (nozzle_tip_z, nozzle_tip_y)
-        else:
-            log.warning("Side View: nozzle detection failed")
-    else:
-        log.warning("Side View: raw_image not provided, "
-                    "nozzle detection skipped")
-
-    # ── 3. Plasma length (contiguous, skipped for filamented) ─────
-    plasma_length = np.nan
-    plasma_length_err = np.nan
-    plasma_start = np.nan
-    plasma_end = np.nan
-
-    if compute_length:
-        lres = _compute_plasma_length(
-            profile_z_robust, threshold_fraction, virtual_peak
-        )
-        plasma_length = lres['length']
-        plasma_length_err = lres['length_err']
-        plasma_start = lres['plasma_start']
-        plasma_end = lres['plasma_end']
-    else:
-        log.info("Plasma length skipped (filamented shot)")
-
-    # ── 4. Column-by-column transverse axis extraction ────────────
-    threshold = threshold_fraction * virtual_peak
-    active_cols = np.where(profile_z_robust >= threshold)[0]
-
-    axis_data = _extract_transverse_axis(
-        img, active_cols,
-        saturation_value=saturation_value,
-        fwhm_fraction_saturated=fwhm_fraction_saturated,
-        fwhm_fraction_unsaturated=fwhm_fraction_unsaturated,
-        smoothing_sigma=smoothing_sigma,
-    )
-
-    axis_z = axis_data['axis_z']
-    axis_y = axis_data['axis_y']
-    axis_y_err = axis_data['axis_y_err']
-    axis_width = axis_data['axis_width']
-    axis_y_left = axis_data['axis_y_left']
-    axis_y_right = axis_data['axis_y_right']
-    saturated_columns_count = axis_data['saturated_count']
-
-    log.info("Side View axis extracted: %d columns analysed "
-             "(%d saturated)", len(axis_z), saturated_columns_count)
-
-    # ── 5. Mean channel height (Y_c) and nozzle distance ─────────
-    valid_y = axis_y[np.isfinite(axis_y)]
-    if len(valid_y) > 0:
-        Y_c_mean = float(np.mean(valid_y))
-        Y_c_mean_err = float(np.std(valid_y) / np.sqrt(len(valid_y)))
-    else:
-        Y_c_mean = np.nan
-        Y_c_mean_err = np.nan
-
-    # Use ignition point (plasma_start) as the robust longitudinal position
-    Z_c = float(plasma_start) if not np.isnan(plasma_start) else np.nan
-    Z_c_err = float(plasma_length_err) if not np.isnan(plasma_length_err) else np.nan
-    log.info("Plasma axis: mean Y=%.1f±%.1f px, ignition Z=%.1f±%.1f px",
-             Y_c_mean, Y_c_mean_err, Z_c, Z_c_err)
-
-    # Z position relative to nozzle
-    Z_pos_rel = np.nan
-    if not np.isnan(nozzle_tip_z):
-        Z_pos_rel = (Z_c - nozzle_tip_z) * px_to_mm
-        log.info("Z relative to nozzle: %.3f mm", Z_pos_rel)
-
-    # Vertical distance ΔY (mean channel height − nozzle tip)
-    nozzle_dist_y = np.nan
-    nozzle_dist_y_err = np.nan
-    nozzle_dist_y_mm = np.nan
-    nozzle_dist_y_mm_err = np.nan
-
-    if not np.isnan(nozzle_tip_y) and not np.isnan(Y_c_mean):
-        nozzle_dist_y = abs(Y_c_mean - nozzle_tip_y)
-        nozzle_tip_err_px = 1.0          # ≈1 px uncertainty on tip
-        nozzle_dist_y_err = float(
-            np.sqrt(Y_c_mean_err ** 2 + nozzle_tip_err_px ** 2)
-        )
-        nozzle_dist_y_mm = nozzle_dist_y * px_to_mm
-        nozzle_dist_y_mm_err = nozzle_dist_y_err * px_to_mm
-        log.info("Nozzle distance (ΔY, mean axis): %.1f±%.1f px = "
-                 "%.3f±%.3f mm",
-                 nozzle_dist_y, nozzle_dist_y_err,
-                 nozzle_dist_y_mm, nozzle_dist_y_mm_err)
-
-    # ── 6. Beam entrance angle (linear fit on axis) ───────────────
+    roi_x, roi_y, roi_w, roi_h = interactive_roi
+    img_roi = img[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+    
+    if img_roi.size == 0:
+        return nan_result
+        
+    max_val = np.max(img_roi)
+    if max_val <= 0:
+        return nan_result
+        
+    thresh_val = threshold_fraction * max_val
+    mask = (img_roi >= thresh_val).astype(np.uint8)
+    
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    
+    valid_labels = []
+    for i in range(1, num_labels):
+        if not np.any(labels[roi_h - 1, :] == i):
+            valid_labels.append(i)
+            
+    if not valid_labels:
+        log.warning("Side View: No valid plasma blobs found in ROI.")
+        return nan_result
+        
+    valid_mask = np.isin(labels, valid_labels)
+    interactive_mask_full = np.zeros(img.shape, dtype=bool)
+    interactive_mask_full[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w] = valid_mask
+    
+    # Estrazione asse geometrico
+    y_indices, x_indices = np.where(interactive_mask_full)
+    
+    # Raggruppa Y per ogni Z e calcola il punto medio
+    unique_z = np.unique(x_indices)
+    axis_z_list = []
+    axis_y_list = []
+    
+    for z in unique_z:
+        ys_for_z = y_indices[x_indices == z]
+        axis_z_list.append(float(z))
+        axis_y_list.append(float(np.mean(ys_for_z)))
+        
+    axis_z = np.array(axis_z_list)
+    axis_y = np.array(axis_y_list)
+    
+    # Centroide Geometrico (Media dei punti asse)
+    Z_centroid = float(np.mean(axis_z))
+    Y_centroid = float(np.mean(axis_y))
+    
+    # Lunghezza Plasma dal blob
+    plasma_length = float(np.max(axis_z) - np.min(axis_z)) if len(axis_z) > 0 else 0.0
+    plasma_length_mm = plasma_length * px_to_mm
+    
+    # Altezza
+    nozzle_dist_y = float((roi_y + roi_h) - Y_centroid)
+    nozzle_dist_y_mm = nozzle_dist_y * px_to_mm
+    
+    # Fit Lineare sull'asse
     beam_angle_mrad = np.nan
     beam_angle_mrad_err = np.nan
-
-    valid = np.isfinite(axis_y)
-    if np.sum(valid) >= 2:
-        z_valid = axis_z[valid]
-        y_valid = axis_y[valid]
-        coeffs = np.polyfit(z_valid, y_valid, deg=1, cov=True)
+    fit_coeffs = None
+    
+    if len(axis_z) >= 2:
+        coeffs = np.polyfit(axis_z, axis_y, deg=1, cov=True)
+        fit_coeffs = coeffs[0]  # slope, intercept
         slope = coeffs[0][0]
         slope_err = np.sqrt(coeffs[1][0, 0])
         beam_angle_mrad = float(np.arctan(slope) * 1000.0)
-        beam_angle_mrad_err = float(
-            slope_err / (1 + slope**2) * 1000.0)
-        log.info("Side beam angle: %.3f ± %.3f mrad",
-                 beam_angle_mrad, beam_angle_mrad_err)
-
-    # ── 7. Mean channel width ─────────────────────────────────────
-    valid_width = axis_width[np.isfinite(axis_width)]
-    mean_fwhm = float(np.mean(valid_width)) if len(valid_width) > 0 \
-        else np.nan
-
-    # ── 8. Convert Plasma Length to mm ─────────────────────────────
-    plasma_length_mm = np.nan
-    plasma_length_mm_err = np.nan
-    if not np.isnan(plasma_length):
-        plasma_length_mm = plasma_length * px_to_mm
-        plasma_length_mm_err = plasma_length_err * px_to_mm
+        beam_angle_mrad_err = float(slope_err / (1 + slope**2) * 1000.0)
+        
+    log.info("Geometric Side Analysis: Z_c=%.1f, Y_c=%.1f, Height=%.1f px, Angle=%.1f mrad",
+             Z_centroid, Y_centroid, nozzle_dist_y, beam_angle_mrad)
 
     return {
-        'Plasma_Z_Position': Z_c,
-        'Plasma_Z_Position_err': Z_c_err,
-        'Plasma_Z_Position_rel': Z_pos_rel,
-        'Plasma_Y_Position': Y_c_mean,
-        'Plasma_Y_Position_err': Y_c_mean_err,
+        'Plasma_Z_Position': Z_centroid,
+        'Plasma_Z_Position_err': np.nan,
+        'Plasma_Z_Position_rel': np.nan,
+        'Plasma_Y_Position': Y_centroid,
+        'Plasma_Y_Position_err': np.nan,
+        'Plasma_Z_Centroid': Z_centroid,
+        'Plasma_Z_Centroid_err': np.nan,
+        'Plasma_Y_Centroid': Y_centroid,
+        'Plasma_Y_Centroid_err': np.nan,
         'Plasma_Length': plasma_length,
-        'Plasma_Length_err': plasma_length_err,
+        'Plasma_Length_err': np.nan,
         'Plasma_Length_mm': plasma_length_mm,
-        'Plasma_Length_mm_err': plasma_length_mm_err,
-        'Max_Intensity': virtual_peak,
-        'Nozzle_Tip_Z': nozzle_tip_z,
-        'Nozzle_Tip_Y': nozzle_tip_y,
+        'Plasma_Length_mm_err': np.nan,
+        'Max_Intensity': float(max_val),
+        'Nozzle_Tip_Z': np.nan,
+        'Nozzle_Tip_Y': np.nan,
         'Nozzle_Distance_Y': nozzle_dist_y,
-        'Nozzle_Distance_Y_err': nozzle_dist_y_err,
+        'Nozzle_Distance_Y_err': np.nan,
         'Nozzle_Distance_Y_mm': nozzle_dist_y_mm,
-        'Nozzle_Distance_Y_mm_err': nozzle_dist_y_mm_err,
+        'Nozzle_Distance_Y_mm_err': np.nan,
         'Side_Beam_Angle_mrad': beam_angle_mrad,
         'Side_Beam_Angle_mrad_err': beam_angle_mrad_err,
-        'Side_Channel_Width_mean': mean_fwhm,
-        'Side_Saturated_Length': float(saturated_columns_count),
+        'Side_Channel_Width_mean': np.nan,
+        'Side_Saturated_Length': np.nan,
         'debug_data': {
-            'nozzle_contour': nozzle_contour,
-            'nozzle_tip': nozzle_tip,
-            'z_profile_robust': profile_z_robust,
-            'plasma_start': plasma_start,
-            'plasma_end': plasma_end,
             'axis_coords': (axis_z, axis_y),
-            'axis_coords_err': axis_y_err,
-            'axis_width': axis_width,
-            'axis_y_left': axis_y_left,
-            'axis_y_right': axis_y_right,
+            'interactive_roi': interactive_roi,
+            'interactive_mask': interactive_mask_full,
+            'fit_coeffs': fit_coeffs
         }
     }
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5B. PLASMA CHANNEL — TOP VIEW
@@ -1319,10 +1072,12 @@ def analyze_plasma_channel_top(
         'Plasma_Z_Position': np.nan, 'Plasma_Z_Position_err': np.nan,
         'Plasma_Y_Position': np.nan, 'Plasma_Y_Position_err': np.nan,
         'Plasma_Length': np.nan, 'Plasma_Length_err': np.nan,
+        'Plasma_Length_mm': np.nan, 'Plasma_Length_mm_err': np.nan,
         'Max_Intensity': 0.0,
         'Top_Beam_Angle_mrad': np.nan,
         'Top_Beam_Angle_mrad_err': np.nan,
         'Top_Channel_Width_mean': np.nan,
+        'Top_Channel_Width_mean_mm': np.nan,
         'Top_Saturated_Length': np.nan,
         'debug_data': {
             'z_profile_robust': profile_z_robust,
@@ -1433,6 +1188,17 @@ def analyze_plasma_channel_top(
     mean_fwhm = float(np.mean(valid_width)) if len(valid_width) > 0 \
         else np.nan
 
+    # ── 7. Convert to mm ──────────────────────────────────────────
+    plasma_length_mm = np.nan
+    plasma_length_mm_err = np.nan
+    if not np.isnan(plasma_length):
+        plasma_length_mm = plasma_length * px_to_mm
+        plasma_length_mm_err = plasma_length_err * px_to_mm
+
+    mean_fwhm_mm = np.nan
+    if not np.isnan(mean_fwhm):
+        mean_fwhm_mm = mean_fwhm * px_to_mm
+
     return {
         'Plasma_Z_Position': Z_c,
         'Plasma_Z_Position_err': Z_c_err,
@@ -1440,10 +1206,13 @@ def analyze_plasma_channel_top(
         'Plasma_Y_Position_err': Y_c_err,
         'Plasma_Length': plasma_length,
         'Plasma_Length_err': plasma_length_err,
+        'Plasma_Length_mm': plasma_length_mm,
+        'Plasma_Length_mm_err': plasma_length_mm_err,
         'Max_Intensity': virtual_peak,
         'Top_Beam_Angle_mrad': beam_angle_mrad,
         'Top_Beam_Angle_mrad_err': beam_angle_mrad_err,
         'Top_Channel_Width_mean': mean_fwhm,
+        'Top_Channel_Width_mean_mm': mean_fwhm_mm,
         'Top_Saturated_Length': float(saturated_columns_count),
         'debug_data': {
             'z_profile_robust': profile_z_robust,
@@ -1452,6 +1221,7 @@ def analyze_plasma_channel_top(
             'axis_width': axis_width,
             'axis_y_left': axis_y_left,
             'axis_y_right': axis_y_right,
+            'fit_coeffs': (slope, intercept) if 'slope' in locals() and 'intercept' in locals() else None,
         }
     }
 
@@ -1464,7 +1234,6 @@ def analyze_plasma_channel_top(
 def analyze_plasma_channel(image_array: np.ndarray,
                            threshold_fraction: float = 0.2,
                            is_top_view: bool = False,
-                           raw_image: np.ndarray = None,
                            **kwargs) -> dict:
     """Dispatch to the appropriate plasma-channel analysis.
 
@@ -1481,8 +1250,6 @@ def analyze_plasma_channel(image_array: np.ndarray,
         Fraction of the virtual peak used for thresholding.
     is_top_view : bool
         Select Top View analysis when True.
-    raw_image : np.ndarray (2D) or None
-        Raw image for nozzle detection (Side View only).
     **kwargs
         Forwarded to the selected implementation.
 
@@ -1496,10 +1263,8 @@ def analyze_plasma_channel(image_array: np.ndarray,
             image_array, threshold_fraction=threshold_fraction, **kwargs
         )
     else:
-        if raw_image is None:
-            log.warning("Side View: raw_image not provided, "
-                        "nozzle detection will be disabled")
         return analyze_plasma_channel_side(
-            image_array, raw_image=raw_image,
+            image_array,
             threshold_fraction=threshold_fraction, **kwargs
         )
+

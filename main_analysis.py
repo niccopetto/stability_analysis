@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse, Circle
 from matplotlib.widgets import RectangleSelector
 import seaborn as sns
+from scipy.stats import linregress
 from skimage import io as skio
 
 import diagnostics_lib as diag
@@ -30,6 +31,7 @@ import diagnostics_lib as diag
 # ═══════════════════════════════════════════════════════════════════════════════
 
 RUN_MODE = "STEP_2_ANALYZE"  # Modalità operative: "STEP_1_CLASSIFY" oppure "STEP_2_ANALYZE"
+TS_ON = False                # Fallback: se True, forza analisi Top+Side anche senza tag TS_ON/TS_IN nel CSV
 
 # Cartella radice contenente le sotto-cartelle strumento (Andor_Lanex/, ecc.)
 ROOT_DIR = Path(r"c:\Users\ILILUser\Desktop\Stability_Analysis")
@@ -51,21 +53,14 @@ TOP_IMAGING_DIR = ROOT_DIR
 # ── Fattori di Conversione Pixel → Millimetri ──
 PX_TO_MM = 0.064           # Pointing Lanex: 1 pixel = 64 µm = 0.064 mm
 PX_TO_MM_SIDE = 1.0 / 179  # Side Imaging: 179 px = 1 mm ≈ 0.00559 mm/px
-PX_TO_MM_TOP = 1.0          # Top Imaging: NON calibrato — aggiornare quando noto
+PX_TO_MM_TOP = 1.0 / 100       # Top Imaging: 100 px = 1 mm
 
 # Soglia frazionaria per la lunghezza del plasma (10% del massimo per includere più coda)
 PLASMA_THRESHOLD_FRACTION = 0.1
 FWHM_FRACTION_SATURATED = 0.8  # Frazione per la larghezza delle colonne saturate (80%)
 
-# ── Parametri Rilevamento Nozzle (Side View) ──
-NOZZLE_CONTOUR_LEVEL_FRACTION = 0.15   # Soglia contorno (15% del massimo raw)
-NOZZLE_INTENSITY_UPPER_LIMIT = 80.0    # Limite superiore intensità per clipping
-                                        # riflessi sul nozzle (None = disabilitato;
-                                        # impostare es. 120 se i riflessi creano
-                                        # contorni spuri)
-
 # ── Parametri Classificazione Fascio (Pointing Lanex) ──
-BEAM_PEAK_THRESHOLD_HI = 0.25     # Soglia alta (30%) per separare blob multipli
+BEAM_PEAK_THRESHOLD_HI = 0.25     # Soglia alta (25%) per separare blob multipli
 BEAM_PEAK_THRESHOLD_LO = 0.15     # Soglia bassa (15%) per misurare estensione diffusa
 BEAM_MIN_BLOB_AREA_PX = 2500      # Area minima blob (pixel)
 BEAM_DIFFUSE_AREA_FRAC = 0.08     # 8% dell'immagine: soglia area per Diffused
@@ -218,117 +213,6 @@ def crop_image(image: np.ndarray, roi: dict) -> np.ndarray:
     return image[roi['y_min']:roi['y_max'], roi['x_min']:roi['x_max']]
 
 
-def interactive_circular_roi_selection(
-        image: np.ndarray,
-        title: str = "Select Circular ROI") -> dict | None:
-    """Mostra un'immagine e permette la selezione di un ROI circolare.
-
-    Interazione:
-      1. Click sinistro → definisce il centro.
-      2. Trascina o click successivo → definisce il raggio.
-      3. Premi 'Enter' per confermare.
-
-    Returns
-    -------
-    dict con chiavi 'center_x', 'center_y', 'radius' (in pixel)
-    oppure None se nessuna selezione è stata fatta.
-    """
-    state = {'center': None, 'radius': None, 'circle_patch': None}
-
-    def on_press(event):
-        if event.inaxes is None:
-            return
-        state['center'] = (event.xdata, event.ydata)
-        state['radius'] = None
-        # Rimuovi cerchio precedente se c'è
-        if state['circle_patch'] is not None:
-            state['circle_patch'].remove()
-            state['circle_patch'] = None
-        fig.canvas.draw_idle()
-
-    def on_motion(event):
-        if state['center'] is None or event.inaxes is None:
-            return
-        cx, cy = state['center']
-        r = np.sqrt((event.xdata - cx) ** 2 + (event.ydata - cy) ** 2)
-        state['radius'] = r
-        # Aggiorna il cerchio
-        if state['circle_patch'] is not None:
-            state['circle_patch'].remove()
-        circle = Circle(
-            (cx, cy), r,
-            facecolor='none', edgecolor='lime', linewidth=2, linestyle='--'
-        )
-        state['circle_patch'] = ax.add_patch(circle)
-        fig.canvas.draw_idle()
-
-    def on_release(event):
-        if state['center'] is None or event.inaxes is None:
-            return
-        cx, cy = state['center']
-        r = np.sqrt((event.xdata - cx) ** 2 + (event.ydata - cy) ** 2)
-        if r > 1:
-            state['radius'] = r
-
-    def on_key(event):
-        if event.key == 'enter' and state['center'] is not None \
-                and state['radius'] is not None:
-            plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.imshow(image, cmap='gray')
-    ax.grid(False)
-    ax.set_title(f"{title}\nClick center, drag radius, press 'Enter'.")
-
-    fig.canvas.mpl_connect('button_press_event', on_press)
-    fig.canvas.mpl_connect('motion_notify_event', on_motion)
-    fig.canvas.mpl_connect('button_release_event', on_release)
-    fig.canvas.mpl_connect('key_press_event', on_key)
-    plt.show(block=True)
-
-    if state['center'] is None or state['radius'] is None:
-        log.warning("Nessun ROI circolare selezionato")
-        return None
-
-    cx, cy = state['center']
-    r = state['radius']
-    log.info("ROI circolare: centro=(%.1f, %.1f), raggio=%.1f px",
-             cx, cy, r)
-    return {'center_x': cx, 'center_y': cy, 'radius': r}
-
-
-def apply_circular_mask(image: np.ndarray, roi_circle: dict) -> np.ndarray:
-    """Applica una maschera circolare: pixel fuori dal cerchio → 0.
-
-    Parameters
-    ----------
-    image : np.ndarray (2D)
-    roi_circle : dict con chiavi 'center_x', 'center_y', 'radius'
-
-    Returns
-    -------
-    np.ndarray — copia dell'immagine con pixel esterni azzerati.
-    """
-    cx = roi_circle['center_x']
-    cy = roi_circle['center_y']
-    r = roi_circle['radius']
-    rows, cols = np.indices(image.shape[:2], dtype=np.float64)
-    dist = np.sqrt((cols - cx) ** 2 + (rows - cy) ** 2)
-    masked = image.copy().astype(np.float64)
-    masked[dist > r] = 0.0
-    return masked
-
-
-def find_first_image_for_instrument(
-        df: pd.DataFrame, path_col: str) -> str | None:
-    """Trova il primo shot con un'immagine valida per uno strumento dato."""
-    if path_col not in df.columns:
-        return None
-    candidates = df[df[path_col].notna()]
-    if candidates.empty:
-        return None
-    return candidates.iloc[0][path_col]
-
 
 def save_plasma_debug_image(
         raw_image: np.ndarray,
@@ -365,19 +249,45 @@ def save_plasma_debug_image(
         ax.plot(nozzle_tip[0], nozzle_tip[1], 'rx', markersize=12,
                 markeredgewidth=2.5, label='Nozzle tip', zorder=10)
 
-    z_c = result.get('Plasma_Z_Position')
-    y_c = result.get('Plasma_Y_Position')
+    z_c = result.get('Plasma_Z_Centroid', result.get('Plasma_Z_Position'))
+    y_c = result.get('Plasma_Y_Centroid', result.get('Plasma_Y_Position'))
     if z_c is not None and y_c is not None:
         if not np.isnan(z_c) and not np.isnan(y_c):
             ax.plot(z_c, y_c, 'y+', markersize=14, markeredgewidth=2.5,
                     label='Plasma centroid', zorder=10)
 
-    # Disegna l'asse del canale estratto (Top View)
+    # Disegna l'asse del canale estratto e il fit
     axis_coords = debug.get('axis_coords')
+    fit_coeffs = debug.get('fit_coeffs')
+    
     if axis_coords is not None:
         axis_z, axis_y = axis_coords
         if len(axis_z) > 0:
-            ax.plot(axis_z, axis_y, 'c.', markersize=2, alpha=0.6, label='Fitted Channel Axis')
+            # Mostra comunque i punti calcolati (per Side View saranno i punti medi, per Top View l'asse)
+            ax.plot(axis_z, axis_y, 'c.', markersize=2, alpha=0.6, label='Extracted Axis points')
+            
+            # Disegna i bordi del canale se disponibili
+            axis_y_l = debug.get('axis_y_left')
+            axis_y_r = debug.get('axis_y_right')
+            if axis_y_l is not None and axis_y_r is not None and len(axis_y_l) == len(axis_z):
+                ax.plot(axis_z, axis_y_l, 'g.', markersize=1, alpha=0.5, label='Channel edges')
+                ax.plot(axis_z, axis_y_r, 'g.', markersize=1, alpha=0.5)
+
+            # Se abbiamo i coefficienti del fit traccia la linea
+            if fit_coeffs is not None:
+                slope, intercept = fit_coeffs
+                z_min, z_max = np.min(axis_z), np.max(axis_z)
+                y_min = slope * z_min + intercept
+                y_max = slope * z_max + intercept
+                
+                # Linea spessa blu sui punti validi
+                ax.plot([z_min, z_max], [y_min, y_max], color='blue', linewidth=2.5, label='Fitted Axis')
+                
+                # Linea tratteggiata estesa su tutta l'immagine
+                w_img = cleaned_image.shape[1]
+                y_0 = intercept
+                y_end = slope * w_img + intercept
+                ax.plot([0, w_img], [y_0, y_end], color='blue', linewidth=0.5, linestyle='--', alpha=0.8)
 
     # Disegna il cerchio ROI
     if roi_circle is not None:
@@ -388,6 +298,23 @@ def save_plasma_debug_image(
             label='ROI Circle'
         )
         ax.add_patch(circle_patch)
+
+    # Disegna Interactive ROI e Mask (se presenti)
+    interactive_roi = debug.get('interactive_roi')
+    if interactive_roi is not None:
+        import matplotlib.patches as patches
+        roi_x, roi_y, roi_w, roi_h = interactive_roi
+        rect = patches.Rectangle((roi_x, roi_y), roi_w, roi_h, linewidth=2, 
+                                 edgecolor='yellow', facecolor='none', linestyle='--', label='Interactive ROI')
+        ax.add_patch(rect)
+        
+    interactive_mask = debug.get('interactive_mask')
+    if interactive_mask is not None:
+        # Crea un overlay rosso semitrasparente per i blob validi
+        overlay = np.zeros((*cleaned_image.shape, 4), dtype=np.float32)
+        overlay[interactive_mask, 0] = 1.0  # R
+        overlay[interactive_mask, 3] = 0.5  # Alpha
+        ax.imshow(overlay, origin='upper', aspect='auto')
 
     ax.legend(loc='upper right', fontsize=8)
     ax.set_title(f"{title_prefix} Plasma Channel Overlay")
@@ -510,10 +437,32 @@ def phase1_ingest_excel(excel_path: Path) -> pd.DataFrame:
             .str.upper()
             .ffill()
         )
+
+        # Estrazione della Posizione del target (P1, P2, ecc.)
+        posizione_pattern = r'\b(P\d+)\b'
+        df['Posizione'] = (
+            df['General_Comments']
+            .astype(str)
+            .str.extract(posizione_pattern, expand=False, flags=re.IGNORECASE)
+            .str.upper()
+            .ffill()
+        )
+
+        # Estrazione dello stato Top+Side Imaging (TS_ON / TS_IN / TS_OFF)
+        ts_pattern = r'TS_(ON|IN|OFF)'
+        df['TS_State'] = (
+            df['General_Comments']
+            .astype(str)
+            .str.extract(ts_pattern, expand=False, flags=re.IGNORECASE)
+            .str.upper()
+            .ffill()
+        )
     else:
         df['Tipo_Maschera'] = np.nan
         df['Magnet_State'] = np.nan
         df['Pointing_State'] = np.nan
+        df['TS_State'] = np.nan
+        df['Posizione'] = np.nan
         log.warning("Colonna 'General_Comments' non trovata: le variabili di stato saranno NaN")
 
 
@@ -523,6 +472,8 @@ def phase1_ingest_excel(excel_path: Path) -> pd.DataFrame:
     log.info("Magnet_State assegnato a %d/%d shot", n_mag, len(df))
     n_pt = df['Pointing_State'].notna().sum()
     log.info("Pointing_State assegnato a %d/%d shot", n_pt, len(df))
+    n_ts = df['TS_State'].isin(['ON', 'IN']).sum()
+    log.info("TS_State ON/IN per %d/%d shot", n_ts, len(df))
 
     return df
 
@@ -631,18 +582,17 @@ def phase2_map_files(df: pd.DataFrame, root_dir: Path, target_date: str = None) 
 
 
 def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
-                         roi_circle_top: dict = None,
                          run_mode: str = "STEP_1_CLASSIFY",
                          debug_output_dir: Path = None,
-                         debug_max_shots: int = 5) -> pd.DataFrame:
+                         ts_on: bool = False) -> pd.DataFrame:
     """Itera sugli shot, applica le funzioni di diagnostics_lib.
 
     Per ogni shot:
     - Injection_Success == False ("No") → salta TUTTO, Beam_Type = 'Null'
     - Is_Filamented → calcola centroide/nozzle (Side+Top) ma salta
       Plasma_Length; salta Pointing/Andor, Beam_Type = 'Null'
-    - SideImaging → analyze_plasma_channel_side (con nozzle da raw image)
-    - TopImaging → analyze_plasma_channel_top (con ROI circolare)
+    - SideImaging → analyze_plasma_channel_side
+    - TopImaging → analyze_plasma_channel_top
     - Pointing_Lanex → classify_beam → analyze_pointing_profile
     - Andor_Lanex → [TEMPORANEAMENTE SOSPESO]
 
@@ -650,12 +600,8 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
     ----------
     roi : dict or None
         Coordinate ROI rettangolare per il crop Pointing Lanex.
-    roi_circle_top : dict or None
-        ROI circolare per Top Imaging {'center_x', 'center_y', 'radius'}.
     debug_output_dir : Path or None
         Se impostato, salva immagini di debug per i primi shot.
-    debug_max_shots : int
-        Numero massimo di shot per cui salvare immagini di debug.
     """
     log.info("═══ FASE 3: Batch Processing ═══")
 
@@ -685,10 +631,11 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
         'Top_Plasma_Z_Position', 'Top_Plasma_Z_Position_err',
         'Top_Plasma_Y_Position', 'Top_Plasma_Y_Position_err',
         'Top_Plasma_Length', 'Top_Plasma_Length_err',
+        'Top_Plasma_Length_mm', 'Top_Plasma_Length_mm_err',
         'Top_Saturated_Length',
         'Top_Max_Intensity',
         'Top_Beam_Angle_mrad', 'Top_Beam_Angle_mrad_err',
-        'Top_Channel_Width_mean',
+        'Top_Channel_Width_mean', 'Top_Channel_Width_mean_mm',
         # Pointing
         'N_Blobs', 'Compactness',
         'X_c', 'Y_c', 'Sigma_X', 'Sigma_Y', 'Total_Intensity',
@@ -705,7 +652,12 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
     total_shots = len(df)
     processed = 0
     debug_saved_side = 0
+    debug_processed_side = 0
     debug_saved_top = 0
+    debug_processed_top = 0
+    
+    interactive_side_roi = None  # Persistent ROI for Side View
+    interactive_top_roi = None   # Persistent ROI for Top View
 
     if debug_output_dir is not None:
         debug_output_dir.mkdir(parents=True, exist_ok=True)
@@ -713,6 +665,13 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
     for shot in df.index:
         date_val = df.at[shot, 'Giorno']
         date_str = str(date_val) if pd.notna(date_val) else None
+        
+        ts_state = df.at[shot, 'TS_State'] if 'TS_State' in df.columns else None
+        
+        # Gestione reset ROI iterativa
+        if pd.notna(ts_state) and str(ts_state).upper() in ('OUT', 'OFF'):
+            interactive_side_roi = None
+            interactive_top_roi = None
 
         # ── Controllo preventivo: Injection_Success ──
         is_injected = df.at[shot, 'Injection_Success'] \
@@ -731,8 +690,14 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
         # ── compute_length: True solo se NON filamented ──
         compute_length = not is_filamented
 
-        # ── 3A. Side Imaging → Plasma Channel ──────────────────────
-        if run_mode == "STEP_2_ANALYZE":
+        # ── 3A. TS: Plasma Channel (Side + Top) ───────────────────
+        # Stato per-shot: colonna TS_State (ON/IN) dal CSV, con fallback
+        # alla costante globale TS_ON
+        shot_ts_on = (pd.notna(ts_state) and str(ts_state).upper() in ('ON', 'IN')) \
+            or (pd.isna(ts_state) and ts_on)
+        if run_mode == "STEP_2_ANALYZE" and shot_ts_on:
+            
+            # --- Side Imaging Execution ---
             try:
                 si_path = df.at[shot, 'Path_SideImaging']
                 if pd.notna(si_path):
@@ -752,15 +717,30 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
                                     "non disponibile o shape incompatibile",
                                     shot)
 
+                        # UI Interattiva per ROI SideImaging
+                        if interactive_side_roi is None:
+                            log.info("Shot %s | Seleziona ROI su SideImaging (Premi ENTER per confermare)", shot)
+                            roi_dict = interactive_roi_selection(img_si_clean, title=f"Select SideImaging ROI for shot {shot}")
+                            
+                            if roi_dict is not None:
+                                roi_x = roi_dict['x_min']
+                                roi_y = roi_dict['y_min']
+                                roi_w = roi_dict['x_max'] - roi_dict['x_min']
+                                roi_h = roi_dict['y_max'] - roi_dict['y_min']
+                                
+                                if roi_w > 0 and roi_h > 0:
+                                    interactive_side_roi = (roi_x, roi_y, roi_w, roi_h)
+                                    log.info("Shot %s | ROI selezionata: %s", shot, interactive_side_roi)
+                                else:
+                                    log.warning("Shot %s | ROI invalida: w=%s, h=%s", shot, roi_w, roi_h)
+                            else:
+                                log.warning("Shot %s | Nessuna ROI selezionata.", shot)
+                        
                         res_si = diag.analyze_plasma_channel_side(
                             img_si_clean,
-                            raw_image=img_si_raw,
+                            interactive_roi=interactive_side_roi,
                             threshold_fraction=PLASMA_THRESHOLD_FRACTION,
-                            contour_level_fraction=NOZZLE_CONTOUR_LEVEL_FRACTION,
-                            intensity_upper_limit=NOZZLE_INTENSITY_UPPER_LIMIT,
-                            fwhm_fraction_saturated=FWHM_FRACTION_SATURATED,
                             px_to_mm=PX_TO_MM_SIDE,
-                            compute_length=compute_length,
                         )
 
                         # Salva risultati nel DataFrame
@@ -769,6 +749,10 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
                         df.at[shot, 'Plasma_Z_Position_rel'] = res_si['Plasma_Z_Position_rel']
                         df.at[shot, 'Plasma_Y_Position'] = res_si['Plasma_Y_Position']
                         df.at[shot, 'Plasma_Y_Position_err'] = res_si['Plasma_Y_Position_err']
+                        df.at[shot, 'Plasma_Z_Centroid'] = res_si['Plasma_Z_Centroid']
+                        df.at[shot, 'Plasma_Z_Centroid_err'] = res_si['Plasma_Z_Centroid_err']
+                        df.at[shot, 'Plasma_Y_Centroid'] = res_si['Plasma_Y_Centroid']
+                        df.at[shot, 'Plasma_Y_Centroid_err'] = res_si['Plasma_Y_Centroid_err']
                         df.at[shot, 'Plasma_Length'] = res_si['Plasma_Length']
                         df.at[shot, 'Plasma_Length_err'] = res_si['Plasma_Length_err']
                         df.at[shot, 'Plasma_Length_mm'] = res_si['Plasma_Length_mm']
@@ -785,19 +769,18 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
                         df.at[shot, 'Side_Channel_Width_mean'] = res_si['Side_Channel_Width_mean']
                         df.at[shot, 'Side_Saturated_Length'] = res_si['Side_Saturated_Length']
 
-                        # Debug image (primi N shot)
-                        if debug_output_dir is not None \
-                                and debug_saved_side < debug_max_shots:
+                        # Debug image (solo per shot esplicitamente TS_ON, max 20)
+                        is_explicit_ts = (pd.notna(ts_state) and str(ts_state).upper() in ('ON', 'IN'))
+                        if debug_output_dir is not None and is_explicit_ts and debug_saved_side < 20:
                             save_plasma_debug_image(
                                 img_si_raw, img_si_clean, res_si,
                                 debug_output_dir / f'debug_side_shot{shot}.png',
                                 title_prefix=f'Shot {shot} Side')
                             debug_saved_side += 1
             except Exception as e:
-                log.warning("Shot %s | SideImaging fallito: %s", shot, e)
+                log.warning("Shot %s | SideImaging fallito: %s", shot, e, exc_info=True)
 
-        # ── 3A-bis. Top Imaging → Plasma Channel ──────────────────
-        if run_mode == "STEP_2_ANALYZE":
+            # --- Top Imaging Execution ---
             try:
                 ti_path_col = 'Path_TopImaging'
                 if ti_path_col in df.columns:
@@ -821,18 +804,71 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
                                         "non disponibile o shape "
                                         "incompatibile", shot)
 
-                            # Applica ROI circolare
-                            if roi_circle_top is not None:
-                                img_ti_clean = apply_circular_mask(
-                                    img_ti_clean, roi_circle_top)
+                            # UI Interattiva per ROI TopImaging
+                            if interactive_top_roi is None:
+                                log.info("Shot %s | Seleziona ROI su TopImaging (Premi ENTER per confermare)", shot)
+                                roi_dict_top = interactive_roi_selection(img_ti_clean, title=f"Select TopImaging ROI for shot {shot}")
+                                
+                                if roi_dict_top is not None:
+                                    roi_x = roi_dict_top['x_min']
+                                    roi_y = roi_dict_top['y_min']
+                                    roi_w = roi_dict_top['x_max'] - roi_dict_top['x_min']
+                                    roi_h = roi_dict_top['y_max'] - roi_dict_top['y_min']
+                                    
+                                    if roi_w > 0 and roi_h > 0:
+                                        interactive_top_roi = (roi_x, roi_y, roi_w, roi_h)
+                                        log.info("Shot %s | ROI Top selezionata: %s", shot, interactive_top_roi)
+                                    else:
+                                        log.warning("Shot %s | ROI Top invalida: w=%s, h=%s", shot, roi_w, roi_h)
+                                else:
+                                    log.warning("Shot %s | Nessuna ROI Top selezionata.", shot)
+
+                            if interactive_top_roi is not None:
+                                roi_x, roi_y, roi_w, roi_h = interactive_top_roi
+                                img_ti_clean_roi = img_ti_clean[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+                            else:
+                                img_ti_clean_roi = img_ti_clean
+
+                            # La ROI circolare iniziale è disattivata
 
                             res_ti = diag.analyze_plasma_channel_top(
-                                img_ti_clean,
+                                img_ti_clean_roi,
                                 threshold_fraction=PLASMA_THRESHOLD_FRACTION,
                                 fwhm_fraction_saturated=FWHM_FRACTION_SATURATED,
                                 px_to_mm=PX_TO_MM_TOP,
                                 compute_length=compute_length,
                             )
+
+                            # Aggiusta le coordinate se è stata applicata la ROI rettangolare
+                            if interactive_top_roi is not None:
+                                roi_x, roi_y, roi_w, roi_h = interactive_top_roi
+                                if not pd.isna(res_ti['Plasma_Z_Position']):
+                                    res_ti['Plasma_Z_Position'] += roi_x
+                                if not pd.isna(res_ti['Plasma_Y_Position']):
+                                    res_ti['Plasma_Y_Position'] += roi_y
+                                
+                                if 'debug_data' in res_ti:
+                                    res_ti['debug_data']['interactive_roi'] = interactive_top_roi
+                                    
+                                    # Trasliamo le coordinate dell'asse geometrico ai riferimenti dell'immagine intera
+                                    axis_z, axis_y = res_ti['debug_data'].get('axis_coords', (np.array([]), np.array([])))
+                                    if len(axis_z) > 0:
+                                        res_ti['debug_data']['axis_coords'] = (axis_z + roi_x, axis_y + roi_y)
+                                        
+                                        # Trasliamo anche i bordi del canale per la visualizzazione corretta
+                                        axis_y_left = res_ti['debug_data'].get('axis_y_left')
+                                        if axis_y_left is not None:
+                                            res_ti['debug_data']['axis_y_left'] = axis_y_left + roi_y
+                                        axis_y_right = res_ti['debug_data'].get('axis_y_right')
+                                        if axis_y_right is not None:
+                                            res_ti['debug_data']['axis_y_right'] = axis_y_right + roi_y
+                                        
+                                    # Paddiamo il profilo Z per centrarlo nell'immagine originaria nel debug
+                                    z_prof = res_ti['debug_data'].get('z_profile_robust')
+                                    if z_prof is not None:
+                                        padded_prof = np.zeros(img_ti_clean.shape[1])
+                                        padded_prof[roi_x:roi_x+roi_w] = z_prof
+                                        res_ti['debug_data']['z_profile_robust'] = padded_prof
 
                             df.at[shot, 'Top_Plasma_Z_Position'] = res_ti['Plasma_Z_Position']
                             df.at[shot, 'Top_Plasma_Z_Position_err'] = res_ti['Plasma_Z_Position_err']
@@ -840,23 +876,25 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
                             df.at[shot, 'Top_Plasma_Y_Position_err'] = res_ti['Plasma_Y_Position_err']
                             df.at[shot, 'Top_Plasma_Length'] = res_ti['Plasma_Length']
                             df.at[shot, 'Top_Plasma_Length_err'] = res_ti['Plasma_Length_err']
+                            df.at[shot, 'Top_Plasma_Length_mm'] = res_ti['Plasma_Length_mm']
+                            df.at[shot, 'Top_Plasma_Length_mm_err'] = res_ti['Plasma_Length_mm_err']
                             df.at[shot, 'Top_Saturated_Length'] = res_ti['Top_Saturated_Length']
                             df.at[shot, 'Top_Max_Intensity'] = res_ti['Max_Intensity']
                             df.at[shot, 'Top_Beam_Angle_mrad'] = res_ti['Top_Beam_Angle_mrad']
                             df.at[shot, 'Top_Beam_Angle_mrad_err'] = res_ti['Top_Beam_Angle_mrad_err']
                             df.at[shot, 'Top_Channel_Width_mean'] = res_ti['Top_Channel_Width_mean']
+                            df.at[shot, 'Top_Channel_Width_mean_mm'] = res_ti['Top_Channel_Width_mean_mm']
 
-                            # Debug image (primi N shot)
-                            if debug_output_dir is not None \
-                                    and debug_saved_top < debug_max_shots:
+                            # Debug image (solo per shot esplicitamente TS_IN, max 20)
+                            is_explicit_ts_in = (pd.notna(ts_state) and str(ts_state).upper() == 'IN')
+                            if debug_output_dir is not None and is_explicit_ts_in and debug_saved_top < 20:
                                 save_plasma_debug_image(
                                     img_ti, img_ti_clean, res_ti,
                                     debug_output_dir / f'debug_top_shot{shot}.png',
-                                    title_prefix=f'Shot {shot} Top',
-                                    roi_circle=roi_circle_top)
+                                    title_prefix=f'Shot {shot} Top')
                                 debug_saved_top += 1
             except Exception as e:
-                log.warning("Shot %s | TopImaging fallito: %s", shot, e)
+                log.warning("Shot %s | TopImaging fallito: %s", shot, e, exc_info=True)
 
         # ── Filamented → salta analisi a valle ──
         if is_filamented:
@@ -935,7 +973,7 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
                                 df.at[shot, 'Total_Intensity'] = \
                                     profile['Total_Intensity']
         except Exception as e:
-            log.warning("Shot %s | Pointing fallito: %s", shot, e)
+            log.warning("Shot %s | Pointing fallito: %s", shot, e, exc_info=True)
 
         # ── 3C. Andor Lanex (Spettrometro) ─────────────────────────
         # [TEMPORANEAMENTE SOSPESO — da integrare successivamente]
@@ -981,60 +1019,110 @@ def phase4_visualize(df: pd.DataFrame, output_dir: Path, roi_center: dict = None
         'round': '#3498db'   # blue
     }
 
-    # ── 4.0 Injection & Filamentation Rates ───────────────────────────
+    posizioni = np.sort(df['Posizione'].dropna().unique()) if 'Posizione' in df.columns else ['All']
+    if len(posizioni) == 0:
+        posizioni = ['All']
+
+    # ── 4.0a Injection Probability ───────────────────────────
+    if 'Injection_Success' in df.columns:
+        fig, axes = plt.subplots(1, len(posizioni), figsize=(5 * len(posizioni), 5), squeeze=False)
+        for i, pos in enumerate(posizioni):
+            ax = axes[0, i]
+            subset = df if pos == 'All' else df[df['Posizione'] == pos]
+            if subset.empty:
+                log.warning(f"00a_injection_probability: Nessun dato per Posizione={pos}")
+                ax.set_title(f"Pos: {pos} (No Data)")
+                ax.axis('off')
+                continue
+                
+            inj_rate = subset.groupby('Tipo_Maschera')['Injection_Success'].mean() * 100
+            if inj_rate.empty:
+                ax.set_title(f"Pos: {pos} (No Data)")
+                ax.axis('off')
+                continue
+                
+            sns.barplot(x=inj_rate.index, y=inj_rate.values, ax=ax, hue=inj_rate.index, palette=mask_palette, legend=False)
+            ax.set_title(f'Injection Probability (Pos: {pos})')
+            ax.set_ylabel('Success Rate (%)' if i == 0 else '')
+            ax.set_ylim(0, 100)
+            
+        fig.tight_layout()
+        fig.savefig(output_dir / '00a_injection_probability.png', dpi=150)
+        plt.close(fig)
+        log.info("Grafico 0a salvato: 00a_injection_probability.png")
+
+    # ── 4.0b Filamentation Rate ──────────────────────────────
     if 'Injection_Success' in df.columns and 'Is_Filamented' in df.columns:
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        
-        # Injection Probability
-        inj_rate = df.groupby('Tipo_Maschera')['Injection_Success'].mean() * 100
-        sns.barplot(x=inj_rate.index, y=inj_rate.values, ax=axes[0], palette=mask_palette)
-        axes[0].set_title('Injection Probability by Mask (%)')
-        axes[0].set_ylabel('Success Rate (%)')
-        
-        # Filamentation Rate (calcolato solo sui successi di iniezione)
         df_inj = df[df['Injection_Success'] == True]
         if not df_inj.empty:
-            fil_rate = df_inj.groupby('Tipo_Maschera')['Is_Filamented'].mean() * 100
-            sns.barplot(x=fil_rate.index, y=fil_rate.values, ax=axes[1], palette=mask_palette)
-        axes[1].set_title('Filamentation Rate by Mask (%)')
-        axes[1].set_ylabel('Filamentation Rate (%)')
-        
-        fig.tight_layout()
-        fig.savefig(output_dir / '00_injection_filamentation_rates.png', dpi=150)
-        plt.close(fig)
-        log.info("Grafico 0 salvato: 00_injection_filamentation_rates.png")
+            fig, axes = plt.subplots(1, len(posizioni), figsize=(5 * len(posizioni), 5), squeeze=False)
+            for i, pos in enumerate(posizioni):
+                ax = axes[0, i]
+                subset = df_inj if pos == 'All' else df_inj[df_inj['Posizione'] == pos]
+                if subset.empty:
+                    log.warning(f"00b_filamentation_rate: Nessun dato per Posizione={pos}")
+                    ax.set_title(f"Pos: {pos} (No Data)")
+                    ax.axis('off')
+                    continue
+                    
+                fil_rate = subset.groupby('Tipo_Maschera')['Is_Filamented'].mean() * 100
+                if fil_rate.empty:
+                    ax.set_title(f"Pos: {pos} (No Data)")
+                    ax.axis('off')
+                    continue
+                    
+                sns.barplot(x=fil_rate.index, y=fil_rate.values, ax=ax, hue=fil_rate.index, palette=mask_palette, legend=False)
+                ax.set_title(f'Filamentation Rate (Pos: {pos})')
+                ax.set_ylabel('Filamentation Rate (%)' if i == 0 else '')
+                ax.set_ylim(0, 100)
+                
+            fig.tight_layout()
+            fig.savefig(output_dir / '00b_filamentation_rate.png', dpi=150)
+            plt.close(fig)
+            log.info("Grafico 0b salvato: 00b_filamentation_rate.png")
 
-    # ── 4.0b Beam Classification Statistics ───────────────────────
+    # ── 4.0c Beam Classification Statistics ───────────────────────
     if 'Beam_Type' in df.columns:
         df_beams = df.dropna(subset=['Beam_Type'])
-        # Escludi i Null dalla visualizzazione (già coperti dal grafico 00)
         df_beams = df_beams[df_beams['Beam_Type'] != 'Null']
         if not df_beams.empty and 'Tipo_Maschera' in df_beams.columns:
-            fig, ax = plt.subplots(figsize=(8, 5))
-
-            beam_colors = {
-                'Collimated': '#2ecc71',
-                'Diffused': '#e67e22',
-                'Multiple': '#3498db'
-            }
-
-            # Stacked bar per maschera
-            ct = pd.crosstab(df_beams['Tipo_Maschera'], df_beams['Beam_Type'])
-            ct.plot(
-                kind='bar', stacked=True, ax=ax,
-                color=[beam_colors.get(c, 'gray') for c in ct.columns]
-            )
-            ax.set_title('Beam Classification by Mask')
-            ax.set_ylabel('Shot Count')
-            ax.legend(title='Beam Type')
-            ax.set_xlabel('Mask Type')
+            fig, axes = plt.subplots(1, len(posizioni), figsize=(6 * len(posizioni), 5), squeeze=False)
+            beam_colors = {'Collimated': '#2ecc71', 'Diffused': '#e67e22', 'Multiple': '#3498db'}
+            
+            for i, pos in enumerate(posizioni):
+                ax = axes[0, i]
+                subset = df_beams if pos == 'All' else df_beams[df_beams['Posizione'] == pos]
+                if subset.empty:
+                    log.warning(f"00c_beam_classification: Nessun dato per Posizione={pos}")
+                    ax.set_title(f"Pos: {pos} (No Data)")
+                    ax.axis('off')
+                    continue
+                
+                ct = pd.crosstab(subset['Tipo_Maschera'], subset['Beam_Type'])
+                if ct.empty:
+                    ax.set_title(f"Pos: {pos} (No Data)")
+                    ax.axis('off')
+                    continue
+                    
+                ct.plot(
+                    kind='bar', stacked=True, ax=ax,
+                    color=[beam_colors.get(c, 'gray') for c in ct.columns]
+                )
+                ax.set_title(f'Beam Class by Mask (Pos: {pos})')
+                ax.set_ylabel('Shot Count' if i == 0 else '')
+                if i == len(posizioni) - 1:
+                    ax.legend(title='Beam Type', bbox_to_anchor=(1.05, 1), loc='upper left')
+                else:
+                    if ax.get_legend() is not None:
+                        ax.get_legend().remove()
+                ax.set_xlabel('Mask Type')
 
             fig.tight_layout()
-            fig.savefig(output_dir / '00b_beam_classification.png', dpi=150)
+            fig.savefig(output_dir / '00c_beam_classification.png', dpi=150)
             plt.close(fig)
-            log.info("Grafico 0b salvato: 00b_beam_classification.png")
+            log.info("Grafico 0c salvato: 00c_beam_classification.png")
         else:
-            log.warning("Grafico 0b saltato: dati Beam_Type insufficienti")
+            log.warning("Grafico 0c saltato: dati Beam_Type insufficienti")
 
     # Filtro: rimuoviamo gli shot non validi dalle statistiche spaziali/energetiche
     df_clean = df.copy()
@@ -1044,24 +1132,30 @@ def phase4_visualize(df: pd.DataFrame, output_dir: Path, roi_center: dict = None
         df_clean = df_clean[df_clean['Is_Filamented'] == False]
 
     # ── 4.1 Plasma Ignition Stability ─────────────────────────────
-    # Il plasma viene calcolato su df_clean (usiamo solo spari buoni per coerenza)
     df_plasma = df_clean.dropna(subset=['Plasma_Z_Position_rel', 'Tipo_Maschera'])
     if not df_plasma.empty:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        
-        # Sovrapposizione di Boxplot (trasparente) e Stripplot (singoli punti)
-        sns.boxplot(data=df_plasma, x='Tipo_Maschera', y='Plasma_Z_Position_rel',
-                    hue='Tipo_Maschera', palette=mask_palette, legend=False, 
-                    ax=ax, boxprops={'alpha': 0.4})
-        
-        sns.stripplot(data=df_plasma, x='Tipo_Maschera', y='Plasma_Z_Position_rel',
-                      hue='Tipo_Maschera', palette=mask_palette, legend=False,
-                      ax=ax, jitter=True, size=5, alpha=0.8, edgecolor='gray', linewidth=0.5)
-                      
-        ax.set_title(r'Plasma Ignition Stability — Start $\Delta Z$ from Nozzle by Mask')
-        ax.set_xlabel('Mask Type')
-        ax.set_ylabel(r'Ignition Start $\Delta Z$ from Nozzle (mm)')
-        
+        fig, axes = plt.subplots(1, len(posizioni), figsize=(6 * len(posizioni), 5), squeeze=False)
+        for i, pos in enumerate(posizioni):
+            ax = axes[0, i]
+            subset = df_plasma if pos == 'All' else df_plasma[df_plasma['Posizione'] == pos]
+            if subset.empty:
+                log.warning(f"01_plasma_stability: Nessun dato per Posizione={pos}")
+                ax.set_title(f"Pos: {pos} (No Data)")
+                ax.axis('off')
+                continue
+                
+            sns.boxplot(data=subset, x='Tipo_Maschera', y='Plasma_Z_Position_rel',
+                        hue='Tipo_Maschera', palette=mask_palette, legend=False, 
+                        ax=ax, boxprops={'alpha': 0.4})
+            
+            sns.stripplot(data=subset, x='Tipo_Maschera', y='Plasma_Z_Position_rel',
+                          hue='Tipo_Maschera', palette=mask_palette, legend=False,
+                          ax=ax, jitter=True, size=5, alpha=0.8, edgecolor='gray', linewidth=0.5)
+                          
+            ax.set_title(fr'Plasma Ignition Stability (Pos: {pos})')
+            ax.set_xlabel('Mask Type')
+            ax.set_ylabel(r'Ignition Start $\Delta Z$ from Nozzle (mm)' if i == 0 else '')
+            
         fig.tight_layout()
         fig.savefig(output_dir / '01_plasma_stability.png', dpi=150)
         plt.close(fig)
@@ -1072,69 +1166,77 @@ def phase4_visualize(df: pd.DataFrame, output_dir: Path, roi_center: dict = None
     # ── 4.2a Pointing Jitter — 2D Scatter with Ellipses ───────────
     df_jitter = df_clean.dropna(subset=['X_c', 'Y_c', 'Tipo_Maschera'])
     if not df_jitter.empty:
-        fig, ax = plt.subplots(figsize=(8, 7))
-        groups = df_jitter.groupby('Tipo_Maschera')
-        colors = {name: mask_palette.get(name, 'gray') for name in groups.groups.keys()}
+        fig_2a, axes_2a = plt.subplots(1, len(posizioni), figsize=(6 * len(posizioni), 6), squeeze=False)
+        fig_2b, axes_2b = plt.subplots(1, len(posizioni), figsize=(6 * len(posizioni), 5), squeeze=False)
+        
+        for i, pos in enumerate(posizioni):
+            ax_2a = axes_2a[0, i]
+            ax_2b = axes_2b[0, i]
+            subset = df_jitter if pos == 'All' else df_jitter[df_jitter['Posizione'] == pos]
+            if subset.empty:
+                log.warning(f"02_pointing_jitter: Nessun dato per Posizione={pos}")
+                ax_2a.set_title(f"Pos: {pos} (No Data)"); ax_2a.axis('off')
+                ax_2b.set_title(f"Pos: {pos} (No Data)"); ax_2b.axis('off')
+                continue
 
-        for name, group in groups:
-            # Calcola le sigma prima per inserirle nella legenda
-            sigma_x = group['X_c'].std()
-            sigma_y = group['Y_c'].std()
-            label_with_sigma = fr"{name} ($\sigma_X={sigma_x:.1f}$, $\sigma_Y={sigma_y:.1f}$)"
+            groups = subset.groupby('Tipo_Maschera')
+            colors = {name: mask_palette.get(name, 'gray') for name in groups.groups.keys()}
 
-            ax.scatter(group['X_c'], group['Y_c'], label=label_with_sigma,
-                       color=colors[name], alpha=0.7, edgecolors='w', s=40)
-            draw_confidence_ellipse(
-                group['X_c'].values, group['Y_c'].values, ax, n_std=2.0,
-                facecolor=colors[name], alpha=0.15, edgecolor=colors[name], lw=2
-            )
-            # Per-mask mean centroid position
-            mean_x = group['X_c'].mean()
-            mean_y = group['Y_c'].mean()
-            ax.plot(mean_x, mean_y, marker='o', markersize=10,
-                    color=colors[name], markeredgecolor='k',
-                    markeredgewidth=1.5, alpha=0.8, zorder=5)
+            for name, group in groups:
+                sigma_x = group['X_c'].std()
+                sigma_y = group['Y_c'].std()
+                label_with_sigma = fr"{name} ($\sigma_X={sigma_x:.1f}$, $\sigma_Y={sigma_y:.1f}$)"
 
-        # Plot references: ROI center and Image center
-        if roi_center is not None:
-            roi_cx = roi_center.get('roi_cx')
-            roi_cy = roi_center.get('roi_cy')
-            if roi_cx is not None and roi_cy is not None:
-                ax.plot(roi_cx * PX_TO_MM, roi_cy * PX_TO_MM, marker='x', markersize=10, markeredgewidth=2,
-                        color='black', zorder=10, label='ROI Center')
-            
-            img_cx = roi_center.get('img_cx')
-            img_cy = roi_center.get('img_cy')
-            if img_cx is not None and img_cy is not None:
-                ax.plot(img_cx * PX_TO_MM, img_cy * PX_TO_MM, marker='+', markersize=18, markeredgewidth=2,
-                        color='black', zorder=10, label='Image Center')
+                ax_2a.scatter(group['X_c'], group['Y_c'], label=label_with_sigma,
+                           color=colors[name], alpha=0.7, edgecolors='w', s=40)
+                draw_confidence_ellipse(
+                    group['X_c'].values, group['Y_c'].values, ax_2a, n_std=2.0,
+                    facecolor=colors[name], alpha=0.15, edgecolor=colors[name], lw=2
+                )
+                mean_x = group['X_c'].mean()
+                mean_y = group['Y_c'].mean()
+                ax_2a.plot(mean_x, mean_y, marker='o', markersize=10,
+                        color=colors[name], markeredgecolor='k',
+                        markeredgewidth=1.5, alpha=0.8, zorder=5)
 
-        ax.set_title(r'Pointing Jitter — Pointing Lanex Centroids ($2\sigma$)')
-        ax.set_xlabel(r'$X_c$ (mm)')
-        ax.set_ylabel(r'$Y_c$ (mm)')
-        ax.legend(title='Mask')
-        ax.set_aspect('equal', adjustable='datalim')
-        ax.invert_yaxis()  # <-- Allinea l'orientamento Y del grafico a quello dell'immagine (0 in alto)
-        fig.tight_layout()
-        fig.savefig(output_dir / '02a_pointing_jitter_scatter.png', dpi=150)
-        plt.close(fig)
+            if roi_center is not None:
+                roi_cx, roi_cy = roi_center.get('roi_cx'), roi_center.get('roi_cy')
+                if roi_cx is not None and roi_cy is not None:
+                    ax_2a.plot(roi_cx * PX_TO_MM, roi_cy * PX_TO_MM, marker='x', markersize=10, markeredgewidth=2,
+                            color='black', zorder=10, label='ROI Center')
+                
+                img_cx, img_cy = roi_center.get('img_cx'), roi_center.get('img_cy')
+                if img_cx is not None and img_cy is not None:
+                    ax_2a.plot(img_cx * PX_TO_MM, img_cy * PX_TO_MM, marker='+', markersize=18, markeredgewidth=2,
+                            color='black', zorder=10, label='Image Center')
+
+            ax_2a.set_title(fr'Pointing Jitter (Pos: {pos})')
+            ax_2a.set_xlabel(r'$X_c$ (mm)')
+            ax_2a.set_ylabel(r'$Y_c$ (mm)' if i == 0 else '')
+            ax_2a.legend(title='Mask', loc='best')
+            ax_2a.set_aspect('equal', adjustable='datalim')
+            ax_2a.invert_yaxis()
+
+            # ── 4.2b Barplot sigma X_c and Y_c ──
+            sigma_stats = groups[['X_c', 'Y_c']].std().reset_index()
+            sigma_stats.rename(columns={'X_c': r'$\sigma_X$', 'Y_c': r'$\sigma_Y$'}, inplace=True)
+            sigma_melt = sigma_stats.melt(id_vars='Tipo_Maschera',
+                                           value_vars=[r'$\sigma_X$', r'$\sigma_Y$'],
+                                           var_name='Axis', value_name=r'$\sigma$ (mm)')
+            sns.barplot(data=sigma_melt, x='Tipo_Maschera', y=r'$\sigma$ (mm)',
+                        hue='Axis', palette='muted', ax=ax_2b)
+            ax_2b.set_title(fr'Centroid $\sigma$ (Pos: {pos})')
+            ax_2b.set_xlabel('Mask Type')
+            ax_2b.set_ylabel(r'$\sigma$ (mm)' if i == 0 else '')
+
+        fig_2a.tight_layout()
+        fig_2a.savefig(output_dir / '02a_pointing_jitter_scatter.png', dpi=150)
+        plt.close(fig_2a)
         log.info("Grafico 2a salvato: 02a_pointing_jitter_scatter.png")
-
-        # ── 4.2b Barplot sigma X_c and Y_c ─────────────────────────────
-        sigma_stats = groups[['X_c', 'Y_c']].std().reset_index()
-        sigma_stats.rename(columns={'X_c': r'$\sigma_X$', 'Y_c': r'$\sigma_Y$'}, inplace=True)
-        sigma_melt = sigma_stats.melt(id_vars='Tipo_Maschera',
-                                       value_vars=[r'$\sigma_X$', r'$\sigma_Y$'],
-                                       var_name='Axis', value_name=r'$\sigma$ (mm)')
-        fig, ax = plt.subplots(figsize=(8, 5))
-        sns.barplot(data=sigma_melt, x='Tipo_Maschera', y=r'$\sigma$ (mm)',
-                    hue='Axis', palette='muted', ax=ax)
-        ax.set_title('Centroid Standard Deviation by Mask')
-        ax.set_xlabel('Mask Type')
-        ax.set_ylabel(r'$\sigma$ (mm)')
-        fig.tight_layout()
-        fig.savefig(output_dir / '02b_pointing_jitter_sigma.png', dpi=150)
-        plt.close(fig)
+        
+        fig_2b.tight_layout()
+        fig_2b.savefig(output_dir / '02b_pointing_jitter_sigma.png', dpi=150)
+        plt.close(fig_2b)
         log.info("Grafico 2b salvato: 02b_pointing_jitter_sigma.png")
     else:
         log.warning("Grafici 2a/2b saltati: dati jitter insufficienti")
@@ -1188,72 +1290,236 @@ def phase4_visualize(df: pd.DataFrame, output_dir: Path, roi_center: dict = None
     #     temporal_col = 'Peak_X'
 
     if temporal_col:
-        # Assicura tipo numerico (alcuni Excel contengono stringhe nella colonna carica)
         df[temporal_col] = pd.to_numeric(df[temporal_col], errors='coerce')
-        df_temp = df.dropna(subset=[temporal_col, 'Tipo_Maschera', 'Giorno'])
-        df_temp = df_temp.copy()
+        df_temp = df.dropna(subset=[temporal_col, 'Tipo_Maschera', 'Giorno']).copy()
         df_temp['Giorno'] = df_temp['Giorno'].astype(str)
+        
         if not df_temp.empty:
-            g = sns.catplot(
-                data=df_temp, x='Giorno', y=temporal_col,
-                hue='Tipo_Maschera', kind='box',
-                palette=mask_palette, height=5, aspect=1.5
-            )
-            g.fig.suptitle(f'Temporal Drift — {temporal_col} by Day and Mask',
-                           y=1.02)
-            g.set_xlabels('Day')
-            g.set_ylabels(temporal_col)
-            g.savefig(output_dir / '04_temporal_drift.png', dpi=150)
-            plt.close(g.fig)
+            fig, axes = plt.subplots(1, len(posizioni), figsize=(8 * len(posizioni), 5), squeeze=False)
+            for i, pos in enumerate(posizioni):
+                ax = axes[0, i]
+                subset = df_temp if pos == 'All' else df_temp[df_temp['Posizione'] == pos]
+                if subset.empty:
+                    log.warning(f"04_temporal_drift: Nessun dato per Posizione={pos}")
+                    ax.set_title(f"Pos: {pos} (No Data)")
+                    ax.axis('off')
+                    continue
+                
+                sns.boxplot(
+                    data=subset, x='Giorno', y=temporal_col,
+                    hue='Tipo_Maschera', palette=mask_palette, ax=ax
+                )
+                ax.set_title(f'Temporal Drift (Pos: {pos})')
+                ax.set_xlabel('Day')
+                ax.set_ylabel(temporal_col if i == 0 else '')
+            
+            fig.tight_layout()
+            fig.savefig(output_dir / '04_temporal_drift.png', dpi=150)
+            plt.close(fig)
             log.info("Grafico 4 salvato: 04_temporal_drift.png")
         else:
             log.warning("Grafico 4 saltato: dati temporali insufficienti")
     else:
         log.warning("Grafico 4 saltato: nessuna colonna temporale disponibile")
 
+    # ── 4.4b Temporal Trend of Geometric Mean of Standard Deviations ──
+    df_jitter = df_clean.dropna(subset=['X_c', 'Y_c', 'Tipo_Maschera', 'Giorno']).copy()
+    if not df_jitter.empty:
+        df_jitter['Giorno'] = df_jitter['Giorno'].astype(str)
+        fig, axes = plt.subplots(1, len(posizioni), figsize=(8 * len(posizioni), 5), squeeze=False)
+        
+        for i, pos in enumerate(posizioni):
+            ax = axes[0, i]
+            subset_pos = df_jitter if pos == 'All' else df_jitter[df_jitter['Posizione'] == pos]
+            if subset_pos.empty:
+                ax.set_title(f"Pos: {pos} (No Data)"); ax.axis('off')
+                continue
+                
+            giorni_list = sorted(subset_pos['Giorno'].unique())
+            mask_list = subset_pos['Tipo_Maschera'].unique()
+            records = []
+            for giorno in giorni_list:
+                for mask in mask_list:
+                    subset = subset_pos[(subset_pos['Giorno'] == giorno) & (subset_pos['Tipo_Maschera'] == mask)]
+                    if len(subset) > 1:
+                        sigma_x = subset['X_c'].std()
+                        sigma_y = subset['Y_c'].std()
+                        geom_sigma = np.sqrt(sigma_x * sigma_y)
+                        records.append({'Giorno': giorno, 'Tipo_Maschera': mask, 'Geom_Sigma': geom_sigma})
+            
+            df_geom_sigma = pd.DataFrame(records)
+            if not df_geom_sigma.empty:
+                sns.pointplot(data=df_geom_sigma, x='Giorno', y='Geom_Sigma', hue='Tipo_Maschera', 
+                              palette=mask_palette, markers='o', linestyles='-', ax=ax)
+                ax.set_title(fr'Geom $\sigma$ Trend (Pos: {pos})')
+                ax.set_xlabel('Day')
+                ax.set_ylabel(r'$\sqrt{\sigma_X \sigma_Y}$ (mm)' if i == 0 else '')
+            else:
+                ax.set_title(f"Pos: {pos} (No Data)"); ax.axis('off')
+
+        fig.tight_layout()
+        fig.savefig(output_dir / '04b_temporal_geom_sigma.png', dpi=150)
+        plt.close(fig)
+        log.info("Grafico 4b salvato: 04b_temporal_geom_sigma.png")
+
+    # ── 4.4c Temporal Trend of Injection Probability ──
+    if 'Injection_Success' in df.columns and 'Giorno' in df.columns:
+        df_inj_temp = df.dropna(subset=['Injection_Success', 'Tipo_Maschera', 'Giorno']).copy()
+        if not df_inj_temp.empty:
+            df_inj_temp['Giorno'] = df_inj_temp['Giorno'].astype(str)
+            fig, axes = plt.subplots(1, len(posizioni), figsize=(8 * len(posizioni), 5), squeeze=False)
+            
+            for i, pos in enumerate(posizioni):
+                ax = axes[0, i]
+                subset_pos = df_inj_temp if pos == 'All' else df_inj_temp[df_inj_temp['Posizione'] == pos]
+                if subset_pos.empty:
+                    ax.set_title(f"Pos: {pos} (No Data)"); ax.axis('off')
+                    continue
+                    
+                giorni_list = sorted(subset_pos['Giorno'].unique())
+                mask_list = subset_pos['Tipo_Maschera'].unique()
+                records_inj = []
+                for giorno in giorni_list:
+                    for mask in mask_list:
+                        subset = subset_pos[(subset_pos['Giorno'] == giorno) & (subset_pos['Tipo_Maschera'] == mask)]
+                        if not subset.empty:
+                            inj_prob = subset['Injection_Success'].mean() * 100
+                            records_inj.append({'Giorno': giorno, 'Tipo_Maschera': mask, 'Injection_Probability': inj_prob})
+                            
+                df_inj_trend = pd.DataFrame(records_inj)
+                if not df_inj_trend.empty:
+                    sns.pointplot(data=df_inj_trend, x='Giorno', y='Injection_Probability', hue='Tipo_Maschera', 
+                                  palette=mask_palette, markers='s', linestyles='-', ax=ax)
+                    ax.set_title(f'Injection Trend (Pos: {pos})')
+                    ax.set_xlabel('Day')
+                    ax.set_ylabel('Injection Probability (%)' if i == 0 else '')
+                else:
+                    ax.set_title(f"Pos: {pos} (No Data)"); ax.axis('off')
+
+            fig.tight_layout()
+            fig.savefig(output_dir / '04c_temporal_injection.png', dpi=150)
+            plt.close(fig)
+            log.info("Grafico 4c salvato: 04c_temporal_injection.png")
+
+    # ── 4.4d Temporal Trend of Spark Length (Top View) ──
+    if 'Top_Plasma_Length_mm' in df.columns and 'Giorno' in df.columns:
+        df_len_top = df_clean.dropna(subset=['Top_Plasma_Length_mm', 'Tipo_Maschera', 'Giorno']).copy()
+        if not df_len_top.empty:
+            df_len_top['Giorno'] = df_len_top['Giorno'].astype(str)
+            fig, axes = plt.subplots(1, len(posizioni), figsize=(8 * len(posizioni), 5), squeeze=False)
+            
+            for i, pos in enumerate(posizioni):
+                ax = axes[0, i]
+                subset = df_len_top if pos == 'All' else df_len_top[df_len_top['Posizione'] == pos]
+                if subset.empty:
+                    ax.set_title(f"Pos: {pos} (No Data)"); ax.axis('off')
+                    continue
+                    
+                dodge_val = 0.2 if subset['Tipo_Maschera'].nunique() > 1 else False
+                sns.pointplot(data=subset, x='Giorno', y='Top_Plasma_Length_mm', hue='Tipo_Maschera', 
+                              palette=mask_palette, dodge=dodge_val, markers='D', linestyles='-', errorbar='sd', ax=ax)
+                ax.set_title(f'Top View Spark Length (Pos: {pos})')
+                ax.set_xlabel('Day')
+                ax.set_ylabel('Spark Length (mm)' if i == 0 else '')
+
+            fig.tight_layout()
+            fig.savefig(output_dir / '04d_temporal_spark_length_top.png', dpi=150)
+            plt.close(fig)
+            log.info("Grafico 4d salvato: 04d_temporal_spark_length_top.png")
+
+    # ── 4.4e Temporal Trend of Spark Length (Side View) ──
+    if 'Plasma_Length_mm' in df.columns and 'Giorno' in df.columns:
+        df_len_side = df_clean.dropna(subset=['Plasma_Length_mm', 'Tipo_Maschera', 'Giorno']).copy()
+        if not df_len_side.empty:
+            df_len_side['Giorno'] = df_len_side['Giorno'].astype(str)
+            fig, axes = plt.subplots(1, len(posizioni), figsize=(8 * len(posizioni), 5), squeeze=False)
+            
+            for i, pos in enumerate(posizioni):
+                ax = axes[0, i]
+                subset = df_len_side if pos == 'All' else df_len_side[df_len_side['Posizione'] == pos]
+                if subset.empty:
+                    ax.set_title(f"Pos: {pos} (No Data)"); ax.axis('off')
+                    continue
+                    
+                dodge_val = 0.2 if subset['Tipo_Maschera'].nunique() > 1 else False
+                sns.pointplot(data=subset, x='Giorno', y='Plasma_Length_mm', hue='Tipo_Maschera', 
+                              palette=mask_palette, dodge=dodge_val, markers='D', linestyles='-', errorbar='sd', ax=ax)
+                ax.set_title(f'Side View Spark Length (Pos: {pos})')
+                ax.set_xlabel('Day')
+                ax.set_ylabel('Spark Length (mm)' if i == 0 else '')
+
+            fig.tight_layout()
+            fig.savefig(output_dir / '04e_temporal_spark_length_side.png', dpi=150)
+            plt.close(fig)
+            log.info("Grafico 4e salvato: 04e_temporal_spark_length_side.png")
+
     log.info("═══ Visualizzazione completata ═══")
 
-    # ── 4.5a Top View Channel Width by Mask ───────────────────────
-    df_width = df_clean.dropna(subset=['Top_Channel_Width_mean', 'Tipo_Maschera'])
+    # ── 4.5a Top View Spark Width by Mask ───────────────────────
+    df_width = df_clean.dropna(subset=['Top_Channel_Width_mean_mm', 'Tipo_Maschera'])
     if not df_width.empty:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        sns.boxplot(data=df_width, x='Tipo_Maschera', y='Top_Channel_Width_mean',
-                    hue='Tipo_Maschera', palette=mask_palette, legend=False, ax=ax)
-        ax.set_title('Top View — Channel Width (FWHM) by Mask')
-        ax.set_xlabel('Mask Type')
-        ax.set_ylabel('Channel Width (px)')
+        fig, axes = plt.subplots(1, len(posizioni), figsize=(8 * len(posizioni), 5), squeeze=False)
+        for i, pos in enumerate(posizioni):
+            ax = axes[0, i]
+            subset = df_width if pos == 'All' else df_width[df_width['Posizione'] == pos]
+            if subset.empty:
+                ax.set_title(f"Pos: {pos} (No Data)"); ax.axis('off')
+                continue
+                
+            sns.boxplot(data=subset, x='Tipo_Maschera', y='Top_Channel_Width_mean_mm',
+                        hue='Tipo_Maschera', palette=mask_palette, legend=False, ax=ax)
+            ax.set_title(f'Top View Spark Width (Pos: {pos})')
+            ax.set_xlabel('Mask Type')
+            ax.set_ylabel('Spark Width (mm)' if i == 0 else '')
+            
         fig.tight_layout()
-        fig.savefig(output_dir / '05a_top_channel_width.png', dpi=150)
+        fig.savefig(output_dir / '05a_top_spark_width.png', dpi=150)
         plt.close(fig)
-        log.info("Grafico 5a salvato: 05a_top_channel_width.png")
+        log.info("Grafico 5a salvato: 05a_top_spark_width.png")
     else:
-        log.warning("Grafico 5a saltato: dati Top_Channel_Width_mean insufficienti")
+        log.warning("Grafico 5a saltato: dati Top_Channel_Width_mean_mm insufficienti")
 
-    # ── 4.5b Top View Plasma Length by Mask ───────────────────────
-    df_len = df_clean.dropna(subset=['Top_Plasma_Length', 'Tipo_Maschera'])
+    # ── 4.5b Top View Spark Length by Mask ───────────────────────
+    df_len = df_clean.dropna(subset=['Top_Plasma_Length_mm', 'Tipo_Maschera'])
     if not df_len.empty:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        sns.boxplot(data=df_len, x='Tipo_Maschera', y='Top_Plasma_Length',
-                    hue='Tipo_Maschera', palette=mask_palette, legend=False, ax=ax)
-        ax.set_title('Top View — Plasma Length by Mask')
-        ax.set_xlabel('Mask Type')
-        ax.set_ylabel('Plasma Length (px)')
+        fig, axes = plt.subplots(1, len(posizioni), figsize=(8 * len(posizioni), 5), squeeze=False)
+        for i, pos in enumerate(posizioni):
+            ax = axes[0, i]
+            subset = df_len if pos == 'All' else df_len[df_len['Posizione'] == pos]
+            if subset.empty:
+                ax.set_title(f"Pos: {pos} (No Data)"); ax.axis('off')
+                continue
+                
+            sns.boxplot(data=subset, x='Tipo_Maschera', y='Top_Plasma_Length_mm',
+                        hue='Tipo_Maschera', palette=mask_palette, legend=False, ax=ax)
+            ax.set_title(f'Top View Spark Length (Pos: {pos})')
+            ax.set_xlabel('Mask Type')
+            ax.set_ylabel('Spark Length (mm)' if i == 0 else '')
+            
         fig.tight_layout()
-        fig.savefig(output_dir / '05b_top_plasma_length.png', dpi=150)
+        fig.savefig(output_dir / '05b_top_spark_length.png', dpi=150)
         plt.close(fig)
-        log.info("Grafico 5b salvato: 05b_top_plasma_length.png")
+        log.info("Grafico 5b salvato: 05b_top_spark_length.png")
     else:
-        log.warning("Grafico 5b saltato: dati Top_Plasma_Length insufficienti")
+        log.warning("Grafico 5b saltato: dati Top_Plasma_Length_mm insufficienti")
 
     # ── 4.6 Side View — Nozzle Distance (ΔY) by Mask ─────────────
     df_nozzle = df_clean.dropna(subset=['Nozzle_Distance_Y_mm', 'Tipo_Maschera'])
     if not df_nozzle.empty:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        sns.boxplot(data=df_nozzle, x='Tipo_Maschera', y='Nozzle_Distance_Y_mm',
-                    hue='Tipo_Maschera', palette=mask_palette, legend=False, ax=ax)
-        ax.set_title(r'Side View — Plasma Height $\Delta Y$ from Nozzle by Mask')
-        ax.set_xlabel('Mask Type')
-        ax.set_ylabel(r'$\Delta Y$ (mm)')
+        fig, axes = plt.subplots(1, len(posizioni), figsize=(8 * len(posizioni), 5), squeeze=False)
+        for i, pos in enumerate(posizioni):
+            ax = axes[0, i]
+            subset = df_nozzle if pos == 'All' else df_nozzle[df_nozzle['Posizione'] == pos]
+            if subset.empty:
+                ax.set_title(f"Pos: {pos} (No Data)"); ax.axis('off')
+                continue
+                
+            sns.boxplot(data=subset, x='Tipo_Maschera', y='Nozzle_Distance_Y_mm',
+                        hue='Tipo_Maschera', palette=mask_palette, legend=False, ax=ax)
+            ax.set_title(fr'Side View $\Delta Y$ Nozzle (Pos: {pos})')
+            ax.set_xlabel('Mask Type')
+            ax.set_ylabel(r'$\Delta Y$ (mm)' if i == 0 else '')
+            
         fig.tight_layout()
         fig.savefig(output_dir / '06a_nozzle_distance_y.png', dpi=150)
         plt.close(fig)
@@ -1264,18 +1530,130 @@ def phase4_visualize(df: pd.DataFrame, output_dir: Path, roi_center: dict = None
     # ── 4.6b Side View — Plasma Length by Mask ────────────────────
     df_side_len = df_clean.dropna(subset=['Plasma_Length_mm', 'Tipo_Maschera'])
     if not df_side_len.empty:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        sns.boxplot(data=df_side_len, x='Tipo_Maschera', y='Plasma_Length_mm',
-                    hue='Tipo_Maschera', palette=mask_palette, legend=False, ax=ax)
-        ax.set_title('Side View — Plasma Length by Mask')
-        ax.set_xlabel('Mask Type')
-        ax.set_ylabel('Plasma Length (mm)')
+        fig, axes = plt.subplots(1, len(posizioni), figsize=(8 * len(posizioni), 5), squeeze=False)
+        for i, pos in enumerate(posizioni):
+            ax = axes[0, i]
+            subset = df_side_len if pos == 'All' else df_side_len[df_side_len['Posizione'] == pos]
+            if subset.empty:
+                ax.set_title(f"Pos: {pos} (No Data)"); ax.axis('off')
+                continue
+                
+            sns.boxplot(data=subset, x='Tipo_Maschera', y='Plasma_Length_mm',
+                        hue='Tipo_Maschera', palette=mask_palette, legend=False, ax=ax)
+            ax.set_title(f'Side View Plasma Length (Pos: {pos})')
+            ax.set_xlabel('Mask Type')
+            ax.set_ylabel('Plasma Length (mm)' if i == 0 else '')
+            
         fig.tight_layout()
         fig.savefig(output_dir / '06b_side_plasma_length.png', dpi=150)
         plt.close(fig)
         log.info("Grafico 6b salvato: 06b_side_plasma_length.png")
     else:
         log.warning("Grafico 6b saltato: dati Plasma_Length_mm insufficienti")
+
+    # ── 4.7 Correlazione Carica vs Lunghezza Canale ───────────────────
+    # Due pannelli (Side mm + Top px), suddivisi per Giorno,
+    # scatter colorato per Tipo_Maschera con fit lineare + R² per maschera.
+    if 'Turbo_ICT_Charge' in df.columns:
+        df['Turbo_ICT_Charge'] = pd.to_numeric(
+            df['Turbo_ICT_Charge'], errors='coerce')
+        df_clean['Turbo_ICT_Charge'] = pd.to_numeric(
+            df_clean['Turbo_ICT_Charge'], errors='coerce')
+
+        length_configs = [
+            ('Plasma_Length_mm', 'Side View — Spark Length (mm)', 'mm'),
+            ('Top_Plasma_Length_mm', 'Top View — Spark Length (mm)', 'mm'),
+        ]
+
+        for length_col, panel_title, unit in length_configs:
+            if length_col not in df.columns:
+                log.warning(
+                    "Grafico 7 saltato per %s: colonna assente", length_col)
+                continue
+
+            df_corr = df_clean.dropna(
+                subset=['Turbo_ICT_Charge', length_col,
+                        'Tipo_Maschera', 'Giorno']).copy()
+            df_corr['Giorno'] = df_corr['Giorno'].astype(str)
+
+            if df_corr.empty:
+                log.warning(
+                    "Grafico 7 saltato per %s: dati insufficienti",
+                    length_col)
+                continue
+
+            giorni = sorted(df_corr['Giorno'].unique())
+            n_giorni = len(giorni)
+            n_pos = len(posizioni)
+
+            fig, axes = plt.subplots(
+                n_giorni, n_pos, figsize=(6 * n_pos, 5 * n_giorni),
+                sharey=True, squeeze=False)
+
+            for i_g, giorno in enumerate(giorni):
+                df_day = df_corr[df_corr['Giorno'] == giorno]
+                for i_p, pos in enumerate(posizioni):
+                    ax = axes[i_g, i_p]
+                    df_m_subset = df_day if pos == 'All' else df_day[df_day['Posizione'] == pos]
+                    
+                    if df_m_subset.empty:
+                        ax.set_title(f"Day {giorno} | Pos: {pos} (No Data)")
+                        ax.axis('off')
+                        continue
+
+                    for mask_type, color in mask_palette.items():
+                        df_m = df_m_subset[df_m_subset['Tipo_Maschera'] == mask_type]
+                        if df_m.empty:
+                            continue
+
+                        x = df_m['Turbo_ICT_Charge'].values.astype(float)
+                        y = df_m[length_col].values.astype(float)
+
+                        ax.scatter(x, y, color=color, alpha=0.7,
+                                   edgecolors='white', linewidths=0.5,
+                                   s=40, label=mask_type, zorder=3)
+
+                        # Fit lineare (servono almeno 2 punti)
+                        if len(x) >= 2:
+                            slope, intercept, r_value, p_value, std_err = linregress(x, y)
+                            r2 = r_value ** 2
+                            x_fit = np.linspace(x.min(), x.max(), 100)
+                            y_fit = slope * x_fit + intercept
+                            ax.plot(x_fit, y_fit, color=color, linewidth=1.5,
+                                    linestyle='--', alpha=0.8)
+                            
+                            p_str = "p<0.001" if p_value < 0.001 else f"p={p_value:.3f}"
+                                
+                            ax.annotate(
+                                f'{mask_type}: R²={r2:.3f}, {p_str}',
+                                xy=(0.05, 0.95 - 0.07 * list(
+                                    mask_palette.keys()).index(mask_type)),
+                                xycoords='axes fraction',
+                                fontsize=9, color=color,
+                                fontweight='bold',
+                                bbox=dict(boxstyle='round,pad=0.2',
+                                          fc='white', alpha=0.7, ec=color))
+
+                    ax.set_title(f'Day {giorno} | Pos: {pos}', fontsize=11)
+                    if i_g == n_giorni - 1:
+                        ax.set_xlabel('Charge (pC)')
+                    if i_p == 0:
+                        ax.set_ylabel(f'Spark Length ({unit})')
+                    ax.legend(loc='lower right', fontsize=8)
+
+            fig.suptitle(
+                f'Charge vs Spark Length — {panel_title}',
+                fontsize=13, fontweight='bold', y=1.02)
+            fig.tight_layout()
+
+            suffix = 'side' if 'Side' in panel_title else 'top'
+            fname = f'07_charge_vs_length_{suffix}.png'
+            fig.savefig(output_dir / fname, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            log.info("Grafico 7 salvato: %s", fname)
+    else:
+        log.warning(
+            "Grafico 7 saltato: colonna Turbo_ICT_Charge non disponibile")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1415,24 +1793,6 @@ def main():
             log.warning("Nessuna immagine Pointing mask_free "
                         "trovata per ROI selection")
 
-        # ── Selezione interattiva ROI circolare per Top Imaging ──
-        roi_circle_top = None
-        first_ti_path = find_first_image_for_instrument(
-            df, 'Path_TopImaging')
-        if first_ti_path is not None:
-            img_ti_roi = safe_imread(first_ti_path)
-            if img_ti_roi is not None:
-                log.info("Selezione ROI circolare Top: %s",
-                         first_ti_path)
-                roi_circle_top = interactive_circular_roi_selection(
-                    img_ti_roi,
-                    title=f"Circular ROI — Top Imaging — "
-                          f"Day {target_date}"
-                )
-        else:
-            log.info("Nessuna immagine TopImaging trovata, "
-                     "ROI circolare saltata")
-
         # Cartella debug per immagini diagnostiche
         day_output = OUTPUT_DIR / target_date
         debug_dir = day_output / 'debug' \
@@ -1441,9 +1801,9 @@ def main():
         # Fase 3
         df = phase3_batch_process(
             df, roi=roi,
-            roi_circle_top=roi_circle_top,
             run_mode=RUN_MODE,
             debug_output_dir=debug_dir,
+            ts_on=TS_ON,
         )
 
         # ── Output giornaliero ────────────────────────────────────────
