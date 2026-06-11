@@ -448,8 +448,8 @@ def phase1_ingest_excel(excel_path: Path) -> pd.DataFrame:
             .ffill()
         )
 
-        # Estrazione dello stato Top+Side Imaging (TS_ON / TS_IN / TS_OFF)
-        ts_pattern = r'TS_(ON|IN|OFF)'
+        # Estrazione dello stato Top+Side Imaging (TS_ON / TS_IN / TS_OFF / TS_OUT)
+        ts_pattern = r'TS_(ON|IN|OFF|OUT)'
         df['TS_State'] = (
             df['General_Comments']
             .astype(str)
