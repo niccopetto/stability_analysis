@@ -655,9 +655,9 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
     debug_processed_side = 0
     debug_saved_top = 0
     debug_processed_top = 0
-    
     interactive_side_roi = None  # Persistent ROI for Side View
     interactive_top_roi = None   # Persistent ROI for Top View
+    previous_posizione = None    # Track position changes
 
     if debug_output_dir is not None:
         debug_output_dir.mkdir(parents=True, exist_ok=True)
@@ -667,9 +667,20 @@ def phase3_batch_process(df: pd.DataFrame, roi: dict = None,
         date_str = str(date_val) if pd.notna(date_val) else None
         
         ts_state = df.at[shot, 'TS_State'] if 'TS_State' in df.columns else None
+        curr_pos = df.at[shot, 'Posizione'] if 'Posizione' in df.columns else None
         
         # Gestione reset ROI iterativa
+        reset_roi = False
         if pd.notna(ts_state) and str(ts_state).upper() in ('OUT', 'OFF'):
+            reset_roi = True
+            
+        if pd.notna(curr_pos):
+            if previous_posizione is not None and curr_pos != previous_posizione:
+                log.info("Cambio Posizione rilevato: %s -> %s. Reset delle ROI interattive.", previous_posizione, curr_pos)
+                reset_roi = True
+            previous_posizione = curr_pos
+            
+        if reset_roi:
             interactive_side_roi = None
             interactive_top_roi = None
 
