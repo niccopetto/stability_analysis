@@ -962,13 +962,19 @@ def analyze_plasma_channel_side(
     beam_angle_mrad_err = np.nan
     fit_coeffs = None
     
-    if len(axis_z) >= 2:
+    if len(axis_z) > 2:
         coeffs = np.polyfit(axis_z, axis_y, deg=1, cov=True)
         fit_coeffs = coeffs[0]  # slope, intercept
         slope = coeffs[0][0]
         slope_err = np.sqrt(coeffs[1][0, 0])
         beam_angle_mrad = float(np.arctan(slope) * 1000.0)
         beam_angle_mrad_err = float(slope_err / (1 + slope**2) * 1000.0)
+    elif len(axis_z) == 2:
+        coeffs = np.polyfit(axis_z, axis_y, deg=1, cov=False)
+        fit_coeffs = coeffs
+        slope = coeffs[0]
+        beam_angle_mrad = float(np.arctan(slope) * 1000.0)
+        beam_angle_mrad_err = np.nan
         
     log.info("Geometric Side Analysis: Z_c=%.1f, Y_c=%.1f, Height=%.1f px, Angle=%.1f mrad",
              Z_centroid, Y_centroid, nozzle_dist_y, beam_angle_mrad)
@@ -1171,7 +1177,7 @@ def analyze_plasma_channel_top(
             y_fit = y_fit[inlier_mask]
 
         # Final fit on cleaned data (with covariance)
-        if len(z_fit) >= 2:
+        if len(z_fit) > 2:
             coeffs = np.polyfit(z_fit, y_fit, deg=1, cov=True)
             slope = coeffs[0][0]
             slope_err = np.sqrt(coeffs[1][0, 0])
@@ -1182,6 +1188,13 @@ def analyze_plasma_channel_top(
                      "(%d/%d points used)",
                      beam_angle_mrad, beam_angle_mrad_err,
                      len(z_fit), int(np.sum(valid)))
+        elif len(z_fit) == 2:
+            coeffs = np.polyfit(z_fit, y_fit, deg=1, cov=False)
+            slope = coeffs[0]
+            beam_angle_mrad = float(np.arctan(slope) * 1000.0)
+            beam_angle_mrad_err = np.nan
+            log.info("Beam angle: %.3f mrad (2 points used, no error est)",
+                     beam_angle_mrad)
 
     # ── 6. Mean channel width ─────────────────────────────────────
     valid_width = axis_width[np.isfinite(axis_width)]
